@@ -106,7 +106,7 @@ type WalletConfigBuilder interface {
 	// fully initializing a wallet.
 	BuildWalletConfig(context.Context, *DatabaseInstances,
 		*rpcperms.InterceptorChain,
-		[]*ListenerWithSignal) (*chainreg.PartialChainControl,
+		[]*ListenerWithSignal, string) (*chainreg.PartialChainControl,
 		*btcwallet.Config, func(), error)
 }
 
@@ -230,7 +230,7 @@ func (d *DefaultWalletImpl) Permissions() map[string][]bakery.Op {
 // NOTE: This is part of the WalletConfigBuilder interface.
 func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	dbs *DatabaseInstances, interceptorChain *rpcperms.InterceptorChain,
-	grpcListeners []*ListenerWithSignal) (*chainreg.PartialChainControl,
+	grpcListeners []*ListenerWithSignal, passwordKey string) (*chainreg.PartialChainControl,
 	*btcwallet.Config, func(), error) {
 
 	// Keep track of our various cleanup functions. We use a defer function
@@ -282,8 +282,10 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 			// into the channel without blocking so we buffer it.
 			MacResponseChan: make(chan []byte, 1),
 		}
-		privateWalletPw = lnwallet.DefaultPrivatePassphrase
-		publicWalletPw  = lnwallet.DefaultPublicPassphrase
+		//privateWalletPw = lnwallet.DefaultPrivatePassphrase
+		//publicWalletPw  = lnwallet.DefaultPublicPassphrase
+		privateWalletPw = []byte(passwordKey)
+		publicWalletPw = []byte(passwordKey)
 	)
 
 	// If the user didn't request a seed, then we'll manually assume a
