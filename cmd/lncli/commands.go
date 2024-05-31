@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"strconv"
@@ -200,6 +199,16 @@ func newAddress(ctx *cli.Context) error {
 	return nil
 }
 
+var coinSelectionStrategyFlag = cli.StringFlag{
+	Name: "coin_selection_strategy",
+	Usage: "(optional) the strategy to use for selecting " +
+		"coins. Possible values are 'largest', 'random', or " +
+		"'global-config'. If either 'largest' or 'random' is " +
+		"specified, it will override the globally configured " +
+		"strategy in lnd.conf",
+	Value: "global-config",
+}
+
 var estimateFeeCommand = cli.Command{
 	Name:      "estimatefee",
 	Category:  "On-chain",
@@ -215,9 +224,10 @@ var estimateFeeCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.Int64Flag{
 			Name: "conf_target",
-			Usage: "(optional) the number of blocks that the transaction *should* " +
-				"confirm in",
+			Usage: "(optional) the number of blocks that the " +
+				"transaction *should* confirm in",
 		},
+		coinSelectionStrategyFlag,
 	},
 	Action: actionDecorator(estimateFees),
 }
@@ -231,12 +241,18 @@ func estimateFees(ctx *cli.Context) error {
 		return err
 	}
 
+	coinSelectionStrategy, err := parseCoinSelectionStrategy(ctx)
+	if err != nil {
+		return err
+	}
+
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
 	resp, err := client.EstimateFee(ctxc, &lnrpc.EstimateFeeRequest{
-		AddrToAmount: amountToAddr,
-		TargetConf:   int32(ctx.Int64("conf_target")),
+		AddrToAmount:          amountToAddr,
+		TargetConf:            int32(ctx.Int64("conf_target")),
+		CoinSelectionStrategy: coinSelectionStrategy,
 	})
 	if err != nil {
 		return err
@@ -313,6 +329,7 @@ var sendCoinsCommand = cli.Command{
 				"terminal avoid breaking existing shell " +
 				"scripts",
 		},
+		coinSelectionStrategyFlag,
 		txLabelFlag,
 	},
 	Action: actionDecorator(sendCoins),
@@ -375,6 +392,11 @@ func sendCoins(ctx *cli.Context) error {
 			"sweep all coins out of the wallet")
 	}
 
+	coinSelectionStrategy, err := parseCoinSelectionStrategy(ctx)
+	if err != nil {
+		return err
+	}
+
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 	minConfs := int32(ctx.Uint64("min_confs"))
@@ -409,14 +431,15 @@ func sendCoins(ctx *cli.Context) error {
 	}
 
 	req := &lnrpc.SendCoinsRequest{
-		Addr:             addr,
-		Amount:           amt,
-		TargetConf:       int32(ctx.Int64("conf_target")),
-		SatPerVbyte:      ctx.Uint64(feeRateFlag),
-		SendAll:          ctx.Bool("sweepall"),
-		Label:            ctx.String(txLabelFlag.Name),
-		MinConfs:         minConfs,
-		SpendUnconfirmed: minConfs == 0,
+		Addr:                  addr,
+		Amount:                amt,
+		TargetConf:            int32(ctx.Int64("conf_target")),
+		SatPerVbyte:           ctx.Uint64(feeRateFlag),
+		SendAll:               ctx.Bool("sweepall"),
+		Label:                 ctx.String(txLabelFlag.Name),
+		MinConfs:              minConfs,
+		SpendUnconfirmed:      minConfs == 0,
+		CoinSelectionStrategy: coinSelectionStrategy,
 	}
 	txid, err := client.SendCoins(ctxc, req)
 	if err != nil {
@@ -585,6 +608,7 @@ var sendManyCommand = cli.Command{
 				"must satisfy",
 			Value: defaultUtxoMinConf,
 		},
+		coinSelectionStrategyFlag,
 		txLabelFlag,
 	},
 	Action: actionDecorator(sendMany),
@@ -615,17 +639,23 @@ func sendMany(ctx *cli.Context) error {
 		return err
 	}
 
+	coinSelectionStrategy, err := parseCoinSelectionStrategy(ctx)
+	if err != nil {
+		return err
+	}
+
 	client, cleanUp := getClient(ctx)
 	defer cleanUp()
 
 	minConfs := int32(ctx.Uint64("min_confs"))
 	txid, err := client.SendMany(ctxc, &lnrpc.SendManyRequest{
-		AddrToAmount:     amountToAddr,
-		TargetConf:       int32(ctx.Int64("conf_target")),
-		SatPerVbyte:      ctx.Uint64(feeRateFlag),
-		Label:            ctx.String(txLabelFlag.Name),
-		MinConfs:         minConfs,
-		SpendUnconfirmed: minConfs == 0,
+		AddrToAmount:          amountToAddr,
+		TargetConf:            int32(ctx.Int64("conf_target")),
+		SatPerVbyte:           ctx.Uint64(feeRateFlag),
+		Label:                 ctx.String(txLabelFlag.Name),
+		MinConfs:              minConfs,
+		SpendUnconfirmed:      minConfs == 0,
+		CoinSelectionStrategy: coinSelectionStrategy,
 	})
 	if err != nil {
 		return err
@@ -1780,7 +1810,7 @@ func getChanInfo(ctx *cli.Context) error {
 	case ctx.Args().Present():
 		chanID, err = strconv.ParseUint(ctx.Args().First(), 10, 64)
 		if err != nil {
-			return fmt.Errorf("error parsing chan_id: %s", err)
+			return fmt.Errorf("error parsing chan_id: %w", err)
 		}
 	default:
 		return fmt.Errorf("chan_id argument missing")
@@ -2166,6 +2196,31 @@ var updateChannelPolicyCommand = cli.Command{
 				"0.000001 (millionths). Can not be set at " +
 				"the same time as fee_rate",
 		},
+		cli.Int64Flag{
+			Name: "inbound_base_fee_msat",
+			Usage: "the base inbound fee in milli-satoshis that " +
+				"will be charged for each forwarded HTLC, " +
+				"regardless of payment size. Its value must " +
+				"be zero or negative - it is a discount " +
+				"for using a particular incoming channel. " +
+				"Note that forwards will be rejected if the " +
+				"discount exceeds the outbound fee " +
+				"(forward at a loss), and lead to " +
+				"penalization by the sender",
+		},
+		cli.Int64Flag{
+			Name: "inbound_fee_rate_ppm",
+			Usage: "the inbound fee rate that will be charged " +
+				"proportionally based on the value of each " +
+				"forwarded HTLC and the outbound fee. Fee " +
+				"rate is expressed in parts per million and " +
+				"must be zero or negative - it is a discount " +
+				"for using a particular incoming channel." +
+				"Note that forwards will be rejected if the " +
+				"discount exceeds the outbound fee " +
+				"(forward at a loss), and lead to " +
+				"penalization by the sender",
+		},
 		cli.Uint64Flag{
 			Name: "time_lock_delta",
 			Usage: "the CLTV delta that will be applied to all " +
@@ -2318,10 +2373,42 @@ func updateChannelPolicy(ctx *cli.Context) error {
 		}
 	}
 
+	inboundBaseFeeMsat := ctx.Int64("inbound_base_fee_msat")
+	if inboundBaseFeeMsat < math.MinInt32 ||
+		inboundBaseFeeMsat > math.MaxInt32 {
+
+		return errors.New("inbound_base_fee_msat out of range")
+	}
+
+	inboundFeeRatePpm := ctx.Int64("inbound_fee_rate_ppm")
+	if inboundFeeRatePpm < math.MinInt32 ||
+		inboundFeeRatePpm > math.MaxInt32 {
+
+		return errors.New("inbound_fee_rate_ppm out of range")
+	}
+
+	// Inbound fees are optional. However, if an update is required,
+	// both the base fee and the fee rate must be provided.
+	var inboundFee *lnrpc.InboundFee
+	if ctx.IsSet("inbound_base_fee_msat") !=
+		ctx.IsSet("inbound_fee_rate_ppm") {
+
+		return errors.New("both parameters must be provided: " +
+			"inbound_base_fee_msat and inbound_fee_rate_ppm")
+	}
+
+	if ctx.IsSet("inbound_fee_rate_ppm") {
+		inboundFee = &lnrpc.InboundFee{
+			BaseFeeMsat: int32(inboundBaseFeeMsat),
+			FeeRatePpm:  int32(inboundFeeRatePpm),
+		}
+	}
+
 	req := &lnrpc.PolicyUpdateRequest{
 		BaseFeeMsat:   baseFee,
 		TimeLockDelta: uint32(timeLockDelta),
 		MaxHtlcMsat:   ctx.Uint64("max_htlc_msat"),
+		InboundFee:    inboundFee,
 	}
 
 	if ctx.IsSet("min_htlc_msat") {
@@ -2761,7 +2848,7 @@ func parseChanBackups(ctx *cli.Context) (*lnrpc.RestoreChanBackupRequest, error)
 		}, nil
 
 	case ctx.IsSet("multi_file"):
-		packedMulti, err := ioutil.ReadFile(ctx.String("multi_file"))
+		packedMulti, err := os.ReadFile(ctx.String("multi_file"))
 		if err != nil {
 			return nil, fmt.Errorf("unable to decode multi packed "+
 				"backup: %v", err)

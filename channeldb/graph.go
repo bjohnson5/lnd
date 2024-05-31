@@ -493,6 +493,16 @@ func (c *ChannelGraph) ForEachNodeDirectedChannel(tx kvdb.RTx,
 			cachedInPolicy.ToNodeFeatures = toNodeFeatures
 		}
 
+		var inboundFee lnwire.Fee
+		if p1 != nil {
+			// Extract inbound fee. If there is a decoding error,
+			// skip this edge.
+			_, err := p1.ExtraOpaqueData.ExtractRecords(&inboundFee)
+			if err != nil {
+				return nil
+			}
+		}
+
 		directedChannel := &DirectedChannel{
 			ChannelID:    e.ChannelID,
 			IsNode1:      node == e.NodeKey1Bytes,
@@ -500,6 +510,7 @@ func (c *ChannelGraph) ForEachNodeDirectedChannel(tx kvdb.RTx,
 			Capacity:     e.Capacity,
 			OutPolicySet: p1 != nil,
 			InPolicy:     cachedInPolicy,
+			InboundFee:   inboundFee,
 		}
 
 		if node == e.NodeKey2Bytes {
@@ -1500,9 +1511,15 @@ func (c *ChannelGraph) pruneGraphNodes(nodes kvdb.RwBucket,
 		// If we reach this point, then there are no longer any edges
 		// that connect this node, so we can delete it.
 		if err := c.deleteLightningNode(nodes, nodePubKey[:]); err != nil {
-			log.Warnf("Unable to prune node %x from the "+
-				"graph: %v", nodePubKey, err)
-			continue
+			if errors.Is(err, ErrGraphNodeNotFound) ||
+				errors.Is(err, ErrGraphNodesNotFound) {
+
+				log.Warnf("Unable to prune node %x from the "+
+					"graph: %v", nodePubKey, err)
+				continue
+			}
+
+			return err
 		}
 
 		log.Infof("Pruned unconnected node %x from channel graph",

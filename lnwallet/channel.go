@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
@@ -371,6 +372,12 @@ type PaymentDescriptor struct {
 	// isForwarded denotes if an incoming HTLC has been forwarded to any
 	// possible upstream peers in the route.
 	isForwarded bool
+
+	// BlindingPoint is an optional ephemeral key used in route blinding.
+	// This value is set for nodes that are relaying payments inside of a
+	// blinded route (ie, not the introduction node) from update_add_htlc's
+	// TLVs.
+	BlindingPoint lnwire.BlindingPointRecord
 }
 
 // PayDescsFromRemoteLogUpdates converts a slice of LogUpdates received from the
@@ -411,6 +418,7 @@ func PayDescsFromRemoteLogUpdates(chanID lnwire.ShortChannelID, height uint64,
 					Height: height,
 					Index:  uint16(i),
 				},
+				BlindingPoint: pd.BlindingPoint,
 			}
 			pd.OnionBlob = make([]byte, len(wireMsg.OnionBlob))
 			copy(pd.OnionBlob[:], wireMsg.OnionBlob[:])
@@ -734,6 +742,7 @@ func (c *commitment) toDiskCommit(ourCommit bool) *channeldb.ChannelCommitment {
 			HtlcIndex:     htlc.HtlcIndex,
 			LogIndex:      htlc.LogIndex,
 			Incoming:      false,
+			BlindingPoint: htlc.BlindingPoint,
 		}
 		copy(h.OnionBlob[:], htlc.OnionBlob)
 
@@ -758,9 +767,9 @@ func (c *commitment) toDiskCommit(ourCommit bool) *channeldb.ChannelCommitment {
 			HtlcIndex:     htlc.HtlcIndex,
 			LogIndex:      htlc.LogIndex,
 			Incoming:      true,
+			BlindingPoint: htlc.BlindingPoint,
 		}
 		copy(h.OnionBlob[:], htlc.OnionBlob)
-
 		if ourCommit && htlc.sig != nil {
 			h.Signature = htlc.sig.Serialize()
 		}
@@ -843,7 +852,7 @@ func (lc *LightningChannel) diskHtlcToPayDesc(feeRate chainfee.SatPerKWeight,
 	// With the scripts reconstructed (depending on if this is our commit
 	// vs theirs or a pending commit for the remote party), we can now
 	// re-create the original payment descriptor.
-	pd = PaymentDescriptor{
+	return PaymentDescriptor{
 		RHash:              htlc.RHash,
 		Timeout:            htlc.RefundTimeout,
 		Amount:             htlc.Amt,
@@ -857,9 +866,8 @@ func (lc *LightningChannel) diskHtlcToPayDesc(feeRate chainfee.SatPerKWeight,
 		ourWitnessScript:   ourWitnessScript,
 		theirPkScript:      theirP2WSH,
 		theirWitnessScript: theirWitnessScript,
-	}
-
-	return pd, nil
+		BlindingPoint:      htlc.BlindingPoint,
+	}, nil
 }
 
 // extractPayDescs will convert all HTLC's present within a disk commit state
@@ -1548,6 +1556,7 @@ func (lc *LightningChannel) logUpdateToPayDesc(logUpdate *channeldb.LogUpdate,
 			HtlcIndex:             wireMsg.ID,
 			LogIndex:              logUpdate.LogIndex,
 			addCommitHeightRemote: commitHeight,
+			BlindingPoint:         wireMsg.BlindingPoint,
 		}
 		pd.OnionBlob = make([]byte, len(wireMsg.OnionBlob))
 		copy(pd.OnionBlob[:], wireMsg.OnionBlob[:])
@@ -1745,6 +1754,7 @@ func (lc *LightningChannel) remoteLogUpdateToPayDesc(logUpdate *channeldb.LogUpd
 			HtlcIndex:            wireMsg.ID,
 			LogIndex:             logUpdate.LogIndex,
 			addCommitHeightLocal: commitHeight,
+			BlindingPoint:        wireMsg.BlindingPoint,
 		}
 		pd.OnionBlob = make([]byte, len(wireMsg.OnionBlob))
 		copy(pd.OnionBlob, wireMsg.OnionBlob[:])
@@ -3600,11 +3610,12 @@ func (lc *LightningChannel) createCommitDiff(
 		switch pd.EntryType {
 		case Add:
 			htlc := &lnwire.UpdateAddHTLC{
-				ChanID:      chanID,
-				ID:          pd.HtlcIndex,
-				Amount:      pd.Amount,
-				Expiry:      pd.Timeout,
-				PaymentHash: pd.RHash,
+				ChanID:        chanID,
+				ID:            pd.HtlcIndex,
+				Amount:        pd.Amount,
+				Expiry:        pd.Timeout,
+				PaymentHash:   pd.RHash,
+				BlindingPoint: pd.BlindingPoint,
 			}
 			copy(htlc.OnionBlob[:], pd.OnionBlob)
 			logUpdate.UpdateMsg = htlc
@@ -3737,11 +3748,12 @@ func (lc *LightningChannel) getUnsignedAckedUpdates() []channeldb.LogUpdate {
 		switch pd.EntryType {
 		case Add:
 			htlc := &lnwire.UpdateAddHTLC{
-				ChanID:      chanID,
-				ID:          pd.HtlcIndex,
-				Amount:      pd.Amount,
-				Expiry:      pd.Timeout,
-				PaymentHash: pd.RHash,
+				ChanID:        chanID,
+				ID:            pd.HtlcIndex,
+				Amount:        pd.Amount,
+				Expiry:        pd.Timeout,
+				PaymentHash:   pd.RHash,
+				BlindingPoint: pd.BlindingPoint,
 			}
 			copy(htlc.OnionBlob[:], pd.OnionBlob)
 			logUpdate.UpdateMsg = htlc
@@ -3789,7 +3801,7 @@ func (lc *LightningChannel) getUnsignedAckedUpdates() []channeldb.LogUpdate {
 // an htlc even if our channel is drained locally.
 // See: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md
 func CalcFeeBuffer(feePerKw chainfee.SatPerKWeight,
-	commitWeight int64) lnwire.MilliSatoshi {
+	commitWeight lntypes.WeightUnit) lnwire.MilliSatoshi {
 
 	// Account for a 100% in fee rate increase.
 	bufferFeePerKw := 2 * feePerKw
@@ -3862,7 +3874,7 @@ func (b BufferType) String() string {
 // and verifies that it does not become negative. This function returns the new
 // balance and the exact buffer amount (excluding the commitment fee).
 func (lc *LightningChannel) applyCommitFee(
-	balance lnwire.MilliSatoshi, commitWeight int64,
+	balance lnwire.MilliSatoshi, commitWeight lntypes.WeightUnit,
 	feePerKw chainfee.SatPerKWeight,
 	buffer BufferType) (lnwire.MilliSatoshi, lnwire.MilliSatoshi, error) {
 
@@ -4719,8 +4731,8 @@ func (lc *LightningChannel) ProcessChanSyncMsg(
 // If the updateState boolean is set true, the add and remove heights of the
 // HTLCs will be set to the next commitment height.
 func (lc *LightningChannel) computeView(view *htlcView, remoteChain bool,
-	updateState bool) (lnwire.MilliSatoshi, lnwire.MilliSatoshi, int64,
-	*htlcView, error) {
+	updateState bool) (lnwire.MilliSatoshi, lnwire.MilliSatoshi,
+	lntypes.WeightUnit, *htlcView, error) {
 
 	commitChain := lc.localCommitChain
 	dustLimit := lc.channelState.LocalChanCfg.DustLimit
@@ -4781,7 +4793,7 @@ func (lc *LightningChannel) computeView(view *htlcView, remoteChain bool,
 
 	// Now go through all HTLCs at this stage, to calculate the total
 	// weight, needed to calculate the transaction fee.
-	var totalHtlcWeight int64
+	var totalHtlcWeight lntypes.WeightUnit
 	for _, htlc := range filteredHTLCView.ourUpdates {
 		if HtlcIsDust(
 			lc.channelState.ChanType, false, !remoteChain,
@@ -5736,11 +5748,12 @@ func (lc *LightningChannel) ReceiveRevocation(revMsg *lnwire.RevokeAndAck) (
 		switch pd.EntryType {
 		case Add:
 			htlc := &lnwire.UpdateAddHTLC{
-				ChanID:      chanID,
-				ID:          pd.HtlcIndex,
-				Amount:      pd.Amount,
-				Expiry:      pd.Timeout,
-				PaymentHash: pd.RHash,
+				ChanID:        chanID,
+				ID:            pd.HtlcIndex,
+				Amount:        pd.Amount,
+				Expiry:        pd.Timeout,
+				PaymentHash:   pd.RHash,
+				BlindingPoint: pd.BlindingPoint,
 			}
 			copy(htlc.OnionBlob[:], pd.OnionBlob)
 			logUpdate.UpdateMsg = htlc
@@ -6079,6 +6092,7 @@ func (lc *LightningChannel) htlcAddDescriptor(htlc *lnwire.UpdateAddHTLC,
 		HtlcIndex:      lc.localUpdateLog.htlcCounter,
 		OnionBlob:      htlc.OnionBlob[:],
 		OpenCircuitKey: openKey,
+		BlindingPoint:  htlc.BlindingPoint,
 	}
 }
 
@@ -6129,13 +6143,14 @@ func (lc *LightningChannel) ReceiveHTLC(htlc *lnwire.UpdateAddHTLC) (uint64, err
 	}
 
 	pd := &PaymentDescriptor{
-		EntryType: Add,
-		RHash:     PaymentHash(htlc.PaymentHash),
-		Timeout:   htlc.Expiry,
-		Amount:    htlc.Amount,
-		LogIndex:  lc.remoteUpdateLog.logIndex,
-		HtlcIndex: lc.remoteUpdateLog.htlcCounter,
-		OnionBlob: htlc.OnionBlob[:],
+		EntryType:     Add,
+		RHash:         PaymentHash(htlc.PaymentHash),
+		Timeout:       htlc.Expiry,
+		Amount:        htlc.Amount,
+		LogIndex:      lc.remoteUpdateLog.logIndex,
+		HtlcIndex:     lc.remoteUpdateLog.htlcCounter,
+		OnionBlob:     htlc.OnionBlob[:],
+		BlindingPoint: htlc.BlindingPoint,
 	}
 
 	localACKedIndex := lc.remoteCommitChain.tail().ourMessageIndex
@@ -7508,7 +7523,7 @@ type AnchorResolution struct {
 	CommitFee btcutil.Amount
 
 	// CommitWeight is the weight of the commit tx.
-	CommitWeight int64
+	CommitWeight lntypes.WeightUnit
 }
 
 // LocalForceCloseSummary describes the final commitment state before the
@@ -8186,7 +8201,7 @@ func NewAnchorResolution(chanState *channeldb.OpenChannel,
 	return &AnchorResolution{
 		CommitAnchor:         *outPoint,
 		AnchorSignDescriptor: *signDesc,
-		CommitWeight:         weight,
+		CommitWeight:         lntypes.WeightUnit(weight),
 		CommitFee:            fee,
 	}, nil
 }
@@ -8212,7 +8227,7 @@ func (lc *LightningChannel) AvailableBalance() lnwire.MilliSatoshi {
 // this method. Additionally, the total weight of the next to be created
 // commitment is returned for accounting purposes.
 func (lc *LightningChannel) availableBalance(
-	buffer BufferType) (lnwire.MilliSatoshi, int64) {
+	buffer BufferType) (lnwire.MilliSatoshi, lntypes.WeightUnit) {
 
 	// We'll grab the current set of log updates that the remote has
 	// ACKed.
@@ -8251,8 +8266,9 @@ func (lc *LightningChannel) availableBalance(
 // commitment, increasing the commitment fee we must pay as an initiator,
 // eating into our balance. It will make sure we won't violate the channel
 // reserve constraints for this amount.
-func (lc *LightningChannel) availableCommitmentBalance(view *htlcView,
-	remoteChain bool, buffer BufferType) (lnwire.MilliSatoshi, int64) {
+func (lc *LightningChannel) availableCommitmentBalance(
+	view *htlcView, remoteChain bool,
+	buffer BufferType) (lnwire.MilliSatoshi, lntypes.WeightUnit) {
 
 	// Compute the current balances for this commitment. This will take
 	// into account HTLCs to determine the commit weight, which the

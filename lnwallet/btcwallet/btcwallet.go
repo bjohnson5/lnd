@@ -978,8 +978,8 @@ func (b *BtcWallet) ImportTaprootScript(scope waddrmgr.KeyScope,
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
-	feeRate chainfee.SatPerKWeight, minConfs int32,
-	label string) (*wire.MsgTx, error) {
+	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+	strategy base.CoinSelectionStrategy) (*wire.MsgTx, error) {
 
 	// Convert our fee rate from sat/kw to sat/kb since it's required by
 	// SendOutputs.
@@ -997,7 +997,7 @@ func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
 
 	return b.wallet.SendOutputs(
 		outputs, nil, defaultAccount, minConfs, feeSatPerKB,
-		b.cfg.CoinSelectionStrategy, label,
+		strategy, label,
 	)
 }
 
@@ -1016,6 +1016,7 @@ func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
 // This is a part of the WalletController interface.
 func (b *BtcWallet) CreateSimpleTx(outputs []*wire.TxOut,
 	feeRate chainfee.SatPerKWeight, minConfs int32,
+	strategy base.CoinSelectionStrategy,
 	dryRun bool) (*txauthor.AuthoredTx, error) {
 
 	// The fee rate is passed in using units of sat/kw, so we'll convert
@@ -1048,7 +1049,7 @@ func (b *BtcWallet) CreateSimpleTx(outputs []*wire.TxOut,
 
 	return b.wallet.CreateSimpleTx(
 		nil, defaultAccount, outputs, minConfs, feeSatPerKB,
-		b.cfg.CoinSelectionStrategy, dryRun,
+		strategy, dryRun,
 	)
 }
 
@@ -1896,4 +1897,35 @@ func (b *BtcWallet) RemoveDescendants(tx *wire.MsgTx) error {
 		wtxmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		return b.wallet.TxStore.RemoveUnminedTx(wtxmgrNs, txRecord)
 	})
+}
+
+// CheckMempoolAcceptance is a wrapper around `TestMempoolAccept` which checks
+// the mempool acceptance of a transaction.
+func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
+	// Use a max feerate of 0 means the default value will be used when
+	// testing mempool acceptance. The default max feerate is 0.10 BTC/kvb,
+	// or 10,000 sat/vb.
+	results, err := b.chain.TestMempoolAccept([]*wire.MsgTx{tx}, 0)
+	if err != nil {
+		return err
+	}
+
+	// Sanity check that the expected single result is returned.
+	if len(results) != 1 {
+		return fmt.Errorf("expected 1 result from TestMempoolAccept, "+
+			"instead got %v", len(results))
+	}
+
+	result := results[0]
+	log.Debugf("TestMempoolAccept result: %s", spew.Sdump(result))
+
+	// Mempool check failed, we now map the reject reason to a proper RPC
+	// error and return it.
+	if !result.Allowed {
+		err := rpcclient.MapRPCErr(errors.New(result.RejectReason))
+
+		return fmt.Errorf("mempool rejection: %w", err)
+	}
+
+	return nil
 }

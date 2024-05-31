@@ -132,7 +132,7 @@ func TestFundPsbtCoinSelect(t *testing.T) {
 		}
 
 		weight := estimator.Weight()
-		fee := chainfee.FeePerKwFloor.FeeForWeight(int64(weight))
+		fee := chainfee.FeePerKwFloor.FeeForWeight(weight)
 
 		return fee + dust
 	}
@@ -574,6 +574,7 @@ func TestFundPsbtCoinSelect(t *testing.T) {
 			resp, err := rpcServer.fundPsbtCoinSelect(
 				"", tc.changeIndex, copiedPacket, 0,
 				tc.changeType, tc.feeRate,
+				rpcServer.cfg.CoinSelectionStrategy,
 			)
 
 			switch {

@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -167,7 +166,7 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		err = ioutil.WriteFile(macFilePath, signerMacBytes, 0644)
+		err = os.WriteFile(macFilePath, signerMacBytes, 0644)
 		if err != nil {
 			_ = os.Remove(macFilePath)
 			return nil, nil, err
@@ -710,14 +709,14 @@ func (s *Server) VerifyMessage(_ context.Context,
 		// for Schnorr signatures.
 		pubkey, err := schnorr.ParsePubKey(in.Pubkey)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse pubkey: %v",
+			return nil, fmt.Errorf("unable to parse pubkey: %w",
 				err)
 		}
 
 		sigParsed, err := schnorr.ParseSignature(in.Signature)
 		if err != nil {
 			return nil, fmt.Errorf("can't parse Schnorr "+
-				"signature: %v", err)
+				"signature: %w", err)
 		}
 
 		var digest []byte
@@ -746,7 +745,7 @@ func (s *Server) VerifyMessage(_ context.Context,
 	}
 	sig, err := wireSig.ToSignature()
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert from wire format: %v",
+		return nil, fmt.Errorf("failed to convert from wire format: %w",
 			err)
 	}
 
@@ -874,7 +873,7 @@ func (s *Server) MuSig2CombineKeys(_ context.Context,
 	// Are there any tweaks to apply to the combined public key?
 	tweaks, err := UnmarshalTweaks(in.Tweaks, in.TaprootTweak)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling tweak options: %v",
+		return nil, fmt.Errorf("error unmarshaling tweak options: %w",
 			err)
 	}
 
@@ -1014,7 +1013,7 @@ func (s *Server) MuSig2CreateSession(_ context.Context,
 	// Are there any tweaks to apply to the combined public key?
 	tweaks, err := UnmarshalTweaks(in.Tweaks, in.TaprootTweak)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling tweak options: %v",
+		return nil, fmt.Errorf("error unmarshaling tweak options: %w",
 			err)
 	}
 
@@ -1139,7 +1138,7 @@ func (s *Server) MuSig2CombineSig(_ context.Context,
 		in.OtherPartialSignatures,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing partial signatures: %v",
+		return nil, fmt.Errorf("error parsing partial signatures: %w",
 			err)
 	}
 

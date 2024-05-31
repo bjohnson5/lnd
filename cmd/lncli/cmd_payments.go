@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -525,13 +525,13 @@ func sendPaymentRequest(ctx *cli.Context,
 
 			recordID, err := strconv.ParseUint(kv[0], 10, 64)
 			if err != nil {
-				return fmt.Errorf("invalid data format: %v",
+				return fmt.Errorf("invalid data format: %w",
 					err)
 			}
 
 			hexValue, err := hex.DecodeString(kv[1])
 			if err != nil {
-				return fmt.Errorf("invalid data format: %v",
+				return fmt.Errorf("invalid data format: %w",
 					err)
 			}
 
@@ -886,6 +886,7 @@ func payInvoice(ctx *cli.Context) error {
 		PaymentRequest:    stripPrefix(payReq),
 		Amt:               ctx.Int64("amt"),
 		DestCustomRecords: make(map[uint64][]byte),
+		Amp:               ctx.Bool(ampFlag.Name),
 	}
 
 	return sendPaymentRequest(ctx, req)
@@ -987,7 +988,7 @@ func sendToRoute(ctx *cli.Context) error {
 	// The user is signalling that we should read stdin in order to parse
 	// the set of target routes.
 	case args.Present() && args.First() == "-":
-		b, err := ioutil.ReadAll(os.Stdin)
+		b, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -1250,9 +1251,9 @@ func parseBlindedPaymentParameters(ctx *cli.Context) (
 		BaseFeeMsat: ctx.Uint64(
 			blindedBaseFlag.Name,
 		),
-		ProportionalFeeMsat: ctx.Uint64(
+		ProportionalFeeRate: uint32(ctx.Uint64(
 			blindedPPMFlag.Name,
-		),
+		)),
 		TotalCltvDelta: uint32(ctx.Uint64(
 			blindedCLTVFlag.Name,
 		)),
@@ -1514,7 +1515,7 @@ func forwardingHistory(ctx *cli.Context) error {
 	case args.Present():
 		i, err := strconv.ParseInt(args.First(), 10, 64)
 		if err != nil {
-			return fmt.Errorf("unable to decode index_offset: %v",
+			return fmt.Errorf("unable to decode index_offset: %w",
 				err)
 		}
 		indexOffset = uint32(i)
@@ -1527,7 +1528,7 @@ func forwardingHistory(ctx *cli.Context) error {
 	case args.Present():
 		m, err := strconv.ParseInt(args.First(), 10, 64)
 		if err != nil {
-			return fmt.Errorf("unable to decode max_events: %v",
+			return fmt.Errorf("unable to decode max_events: %w",
 				err)
 		}
 		maxEvents = uint32(m)
@@ -1616,7 +1617,7 @@ func buildRoute(ctx *cli.Context) error {
 	for _, k := range hops {
 		pubkey, err := route.NewVertexFromStr(k)
 		if err != nil {
-			return fmt.Errorf("error parsing %v: %v", k, err)
+			return fmt.Errorf("error parsing %v: %w", k, err)
 		}
 		rpcHops = append(rpcHops, pubkey[:])
 	}
@@ -1757,7 +1758,7 @@ func deletePayments(ctx *cli.Context) error {
 	case singlePayment:
 		paymentHash, err = hex.DecodeString(ctx.String("payment_hash"))
 		if err != nil {
-			return fmt.Errorf("error decoding payment_hash: %v",
+			return fmt.Errorf("error decoding payment_hash: %w",
 				err)
 		}
 
@@ -1766,7 +1767,7 @@ func deletePayments(ctx *cli.Context) error {
 			FailedHtlcsOnly: failedHTLCsOnly,
 		})
 		if err != nil {
-			return fmt.Errorf("error deleting single payment: %v",
+			return fmt.Errorf("error deleting single payment: %w",
 				err)
 		}
 
@@ -1783,6 +1784,7 @@ func deletePayments(ctx *cli.Context) error {
 			what)
 		_, err = client.DeleteAllPayments(
 			ctxc, &lnrpc.DeleteAllPaymentsRequest{
+				AllPayments:        includeNonFailed,
 				FailedPaymentsOnly: !includeNonFailed,
 				FailedHtlcsOnly:    failedHTLCsOnly,
 			},

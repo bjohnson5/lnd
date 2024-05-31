@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -150,7 +149,7 @@ func profileAdd(ctx *cli.Context) error {
 	// All done, store the updated profile file.
 	f.Profiles = append(f.Profiles, profile)
 	if err = saveProfileFile(defaultProfileFile, f); err != nil {
-		return fmt.Errorf("error writing profile file %s: %v",
+		return fmt.Errorf("error writing profile file %s: %w",
 			defaultProfileFile, err)
 	}
 
@@ -423,7 +422,7 @@ func profileAddMacaroon(ctx *cli.Context) error {
 
 	// Now load and possibly encrypt the macaroon file.
 	macPath := lncfg.CleanAndExpandPath(ctx.GlobalString("macaroonpath"))
-	macBytes, err := ioutil.ReadFile(macPath)
+	macBytes, err := os.ReadFile(macPath)
 	if err != nil {
 		return fmt.Errorf("unable to read macaroon path: %w", err)
 	}
@@ -443,7 +442,7 @@ func profileAddMacaroon(ctx *cli.Context) error {
 		selectedProfile.Macaroons.Jar, macEntry,
 	)
 	if err = saveProfileFile(defaultProfileFile, f); err != nil {
-		return fmt.Errorf("error writing profile file %s: %v",
+		return fmt.Errorf("error writing profile file %s: %w",
 			defaultProfileFile, err)
 	}
 

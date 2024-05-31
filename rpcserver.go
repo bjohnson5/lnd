@@ -30,6 +30,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/davecgh/go-spew/spew"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -45,6 +46,7 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/feature"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
@@ -82,6 +84,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"gopkg.in/macaroon-bakery.v2/bakery"
+)
+
+const (
+	// defaultNumBlocksEstimate is the number of blocks that we fall back
+	// to issuing an estimate for if a fee pre fence doesn't specify an
+	// explicit conf target or fee rate.
+	defaultNumBlocksEstimate = 6
 )
 
 var (
@@ -1067,8 +1076,8 @@ func allowCORS(handler http.Handler, origins []string) http.Handler {
 // more addresses specified in the passed payment map. The payment map maps an
 // address to a specified output value to be sent to that address.
 func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64,
-	feeRate chainfee.SatPerKWeight, minConfs int32,
-	label string) (*chainhash.Hash, error) {
+	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+	strategy wallet.CoinSelectionStrategy) (*chainhash.Hash, error) {
 
 	outputs, err := addrPairsToOutputs(paymentMap, r.cfg.ActiveNetParams.Params)
 	if err != nil {
@@ -1078,7 +1087,7 @@ func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64,
 	// We first do a dry run, to sanity check we won't spend our wallet
 	// balance below the reserved amount.
 	authoredTx, err := r.server.cc.Wallet.CreateSimpleTx(
-		outputs, feeRate, minConfs, true,
+		outputs, feeRate, minConfs, strategy, true,
 	)
 	if err != nil {
 		return nil, err
@@ -1099,7 +1108,7 @@ func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64,
 	// If that checks out, we're fairly confident that creating sending to
 	// these outputs will keep the wallet balance above the reserve.
 	tx, err := r.server.cc.Wallet.SendOutputs(
-		outputs, feeRate, minConfs, label,
+		outputs, feeRate, minConfs, label, strategy,
 	)
 	if err != nil {
 		return nil, err
@@ -1174,11 +1183,13 @@ func (r *rpcServer) EstimateFee(ctx context.Context,
 	// Query the fee estimator for the fee rate for the given confirmation
 	// target.
 	target := in.TargetConf
-	feePerKw, err := sweep.DetermineFeePerKw(
-		r.server.cc.FeeEstimator, sweep.FeePreference{
-			ConfTarget: uint32(target),
-		},
-	)
+	feePref := sweep.FeeEstimateInfo{
+		ConfTarget: uint32(target),
+	}
+
+	// Since we are providing a fee estimation as an RPC response, there's
+	// no need to set a max feerate here, so we use 0.
+	feePerKw, err := feePref.Estimate(r.server.cc.FeeEstimator, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1192,12 +1203,23 @@ func (r *rpcServer) EstimateFee(ctx context.Context,
 		return nil, err
 	}
 
+	coinSelectionStrategy, err := lnrpc.UnmarshallCoinSelectionStrategy(
+		in.CoinSelectionStrategy,
+		r.server.cc.Wallet.Cfg.CoinSelectionStrategy,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// We will ask the wallet to create a tx using this fee rate. We set
 	// dryRun=true to avoid inflating the change addresses in the db.
 	var tx *txauthor.AuthoredTx
 	wallet := r.server.cc.Wallet
 	err = wallet.WithCoinSelectLock(func() error {
-		tx, err = wallet.CreateSimpleTx(outputs, feePerKw, minConfs, true)
+		tx, err = wallet.CreateSimpleTx(
+			outputs, feePerKw, minConfs, coinSelectionStrategy,
+			true,
+		)
 		return err
 	})
 	if err != nil {
@@ -1225,15 +1247,46 @@ func (r *rpcServer) EstimateFee(ctx context.Context,
 	return resp, nil
 }
 
+// maybeUseDefaultConf makes sure that when the user doesn't set either the fee
+// rate or conf target, the default conf target is used.
+func maybeUseDefaultConf(satPerByte int64, satPerVByte uint64,
+	targetConf uint32) uint32 {
+
+	// If the fee rate is set, there's no need to use the default conf
+	// target. In this case, we just return the targetConf from the
+	// request.
+	if satPerByte != 0 || satPerVByte != 0 {
+		return targetConf
+	}
+
+	// Return the user specified conf target if set.
+	if targetConf != 0 {
+		return targetConf
+	}
+
+	// If the fee rate is not set, yet the conf target is zero, the default
+	// 6 will be returned.
+	rpcsLog.Errorf("Expected either 'sat_per_vbyte' or 'conf_target' to " +
+		"be set, using default conf of 6 instead")
+
+	return defaultNumBlocksEstimate
+}
+
 // SendCoins executes a request to send coins to a particular address. Unlike
 // SendMany, this RPC call only allows creating a single output at a time.
 func (r *rpcServer) SendCoins(ctx context.Context,
 	in *lnrpc.SendCoinsRequest) (*lnrpc.SendCoinsResponse, error) {
 
+	// Keep the old behavior prior to 0.18.0 - when the user doesn't set
+	// fee rate or conf target, the default conf target of 6 is used.
+	targetConf := maybeUseDefaultConf(
+		in.SatPerByte, in.SatPerVbyte, uint32(in.TargetConf),
+	)
+
 	// Calculate an appropriate fee rate for this transaction.
 	feePerKw, err := lnrpc.CalculateFeeRate(
 		uint64(in.SatPerByte), in.SatPerVbyte, // nolint:staticcheck
-		uint32(in.TargetConf), r.server.cc.FeeEstimator,
+		targetConf, r.server.cc.FeeEstimator,
 	)
 	if err != nil {
 		return nil, err
@@ -1281,6 +1334,14 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 		return nil, err
 	}
 
+	coinSelectionStrategy, err := lnrpc.UnmarshallCoinSelectionStrategy(
+		in.CoinSelectionStrategy,
+		r.server.cc.Wallet.Cfg.CoinSelectionStrategy,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	var txid *chainhash.Hash
 
 	wallet := r.server.cc.Wallet
@@ -1310,7 +1371,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 		// pay to the change address created above if we needed to
 		// reserve any value, the rest will go to targetAddr.
 		sweepTxPkg, err := sweep.CraftSweepAllTx(
-			maxFeeRate, feePerKw, uint32(bestHeight), nil,
+			feePerKw, maxFeeRate, uint32(bestHeight), nil,
 			targetAddr, wallet, wallet, wallet.WalletController,
 			r.server.cc.Signer, minConfs,
 		)
@@ -1363,7 +1424,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 			}
 
 			sweepTxPkg, err = sweep.CraftSweepAllTx(
-				maxFeeRate, feePerKw, uint32(bestHeight),
+				feePerKw, maxFeeRate, uint32(bestHeight),
 				outputs, targetAddr, wallet, wallet,
 				wallet.WalletController,
 				r.server.cc.Signer, minConfs,
@@ -1417,7 +1478,8 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 		paymentMap := map[string]int64{targetAddr.String(): in.Amount}
 		err := wallet.WithCoinSelectLock(func() error {
 			newTXID, err := r.sendCoinsOnChain(
-				paymentMap, feePerKw, minConfs, label,
+				paymentMap, feePerKw, minConfs,
+				label, coinSelectionStrategy,
 			)
 			if err != nil {
 				return err
@@ -1442,10 +1504,16 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 func (r *rpcServer) SendMany(ctx context.Context,
 	in *lnrpc.SendManyRequest) (*lnrpc.SendManyResponse, error) {
 
+	// Keep the old behavior prior to 0.18.0 - when the user doesn't set
+	// fee rate or conf target, the default conf target of 6 is used.
+	targetConf := maybeUseDefaultConf(
+		in.SatPerByte, in.SatPerVbyte, uint32(in.TargetConf),
+	)
+
 	// Calculate an appropriate fee rate for this transaction.
 	feePerKw, err := lnrpc.CalculateFeeRate(
 		uint64(in.SatPerByte), in.SatPerVbyte, // nolint:staticcheck
-		uint32(in.TargetConf), r.server.cc.FeeEstimator,
+		targetConf, r.server.cc.FeeEstimator,
 	)
 	if err != nil {
 		return nil, err
@@ -1463,6 +1531,14 @@ func (r *rpcServer) SendMany(ctx context.Context,
 		return nil, err
 	}
 
+	coinSelectionStrategy, err := lnrpc.UnmarshallCoinSelectionStrategy(
+		in.CoinSelectionStrategy,
+		r.server.cc.Wallet.Cfg.CoinSelectionStrategy,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	rpcsLog.Infof("[sendmany] outputs=%v, sat/kw=%v",
 		spew.Sdump(in.AddrToAmount), int64(feePerKw))
 
@@ -1474,7 +1550,8 @@ func (r *rpcServer) SendMany(ctx context.Context,
 	wallet := r.server.cc.Wallet
 	err = wallet.WithCoinSelectLock(func() error {
 		sendManyTXID, err := r.sendCoinsOnChain(
-			in.AddrToAmount, feePerKw, minConfs, label,
+			in.AddrToAmount, feePerKw, minConfs,
+			label, coinSelectionStrategy,
 		)
 		if err != nil {
 			return err
@@ -1856,9 +1933,9 @@ func newFundingShimAssembler(chanPointShim *lnrpc.ChanPointShim, initiator bool,
 	), nil
 }
 
-// newFundingShimAssembler returns a new fully populated
+// newPsbtAssembler returns a new fully populated
 // chanfunding.PsbtAssembler using a FundingShim obtained from an RPC caller.
-func newPsbtAssembler(req *lnrpc.OpenChannelRequest, normalizedMinConfs int32,
+func newPsbtAssembler(req *lnrpc.OpenChannelRequest,
 	psbtShim *lnrpc.PsbtShim, netParams *chaincfg.Params) (
 	chanfunding.Assembler, error) {
 
@@ -1872,11 +1949,6 @@ func newPsbtAssembler(req *lnrpc.OpenChannelRequest, normalizedMinConfs int32,
 	if len(psbtShim.PendingChanId) != 32 {
 		return nil, fmt.Errorf("pending chan ID not set")
 	}
-	if normalizedMinConfs != 1 {
-		return nil, fmt.Errorf("setting non-default values for " +
-			"minimum confirmation is not supported for PSBT " +
-			"funding")
-	}
 	if req.SatPerByte != 0 || req.SatPerVbyte != 0 || req.TargetConf != 0 { // nolint:staticcheck
 		return nil, fmt.Errorf("specifying fee estimation parameters " +
 			"is not supported for PSBT funding")
@@ -1889,7 +1961,7 @@ func newPsbtAssembler(req *lnrpc.OpenChannelRequest, normalizedMinConfs int32,
 			bytes.NewReader(psbtShim.BasePsbt), false,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing base PSBT: %v",
+			return nil, fmt.Errorf("error parsing base PSBT: %w",
 				err)
 		}
 	}
@@ -2098,23 +2170,35 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 		return nil, fmt.Errorf("cannot open channel to self")
 	}
 
-	// Calculate an appropriate fee rate for this transaction.
-	feeRate, err := lnrpc.CalculateFeeRate(
-		uint64(in.SatPerByte), in.SatPerVbyte, // nolint:staticcheck
-		uint32(in.TargetConf), r.server.cc.FeeEstimator,
-	)
-	if err != nil {
-		return nil, err
-	}
+	var feeRate chainfee.SatPerKWeight
 
-	rpcsLog.Debugf("[openchannel]: using fee of %v sat/kw for funding tx",
-		int64(feeRate))
+	// Skip estimating fee rate for PSBT funding.
+	if in.FundingShim == nil || in.FundingShim.GetPsbtShim() == nil {
+		// Keep the old behavior prior to 0.18.0 - when the user
+		// doesn't set fee rate or conf target, the default conf target
+		// of 6 is used.
+		targetConf := maybeUseDefaultConf(
+			in.SatPerByte, in.SatPerVbyte, uint32(in.TargetConf),
+		)
+
+		// Calculate an appropriate fee rate for this transaction.
+		feeRate, err = lnrpc.CalculateFeeRate(
+			uint64(in.SatPerByte), in.SatPerVbyte,
+			targetConf, r.server.cc.FeeEstimator,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		rpcsLog.Debugf("[openchannel]: using fee of %v sat/kw for "+
+			"funding tx", int64(feeRate))
+	}
 
 	script, err := chancloser.ParseUpfrontShutdownAddress(
 		in.CloseAddress, r.cfg.ActiveNetParams.Params,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing upfront shutdown: %v",
+		return nil, fmt.Errorf("error parsing upfront shutdown: %w",
 			err)
 	}
 
@@ -2314,8 +2398,12 @@ func (r *rpcServer) OpenChannel(in *lnrpc.OpenChannelRequest,
 			// chanfunding.PsbtAssembler to construct the funding
 			// transaction.
 			copy(req.PendingChanID[:], psbtShim.PendingChanId)
+
+			// NOTE: For the PSBT case we do also allow unconfirmed
+			// utxos to fund the psbt transaction because we make
+			// sure we only use stable utxos.
 			req.ChanFunder, err = newPsbtAssembler(
-				in, req.MinConfs, psbtShim,
+				in, psbtShim,
 				&r.server.cc.Wallet.Cfg.NetParams,
 			)
 			if err != nil {
@@ -2644,12 +2732,19 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 				"is offline (try force closing it instead): %v", err)
 		}
 
+		// Keep the old behavior prior to 0.18.0 - when the user
+		// doesn't set fee rate or conf target, the default conf target
+		// of 6 is used.
+		targetConf := maybeUseDefaultConf(
+			in.SatPerByte, in.SatPerVbyte, uint32(in.TargetConf),
+		)
+
 		// Based on the passed fee related parameters, we'll determine
 		// an appropriate fee rate for the cooperative closure
 		// transaction.
 		feeRate, err := lnrpc.CalculateFeeRate(
 			uint64(in.SatPerByte), in.SatPerVbyte, // nolint:staticcheck
-			uint32(in.TargetConf), r.server.cc.FeeEstimator,
+			targetConf, r.server.cc.FeeEstimator,
 		)
 		if err != nil {
 			return err
@@ -6059,6 +6154,23 @@ func marshalExtraOpaqueData(data []byte) map[uint64][]byte {
 	return records
 }
 
+// extractInboundFeeSafe tries to extract the inbound fee from the given extra
+// opaque data tlv block. If parsing fails, a zero inbound fee is returned. This
+// function is typically used on unvalidated data coming stored in the database.
+// There is not much we can do other than ignoring errors here.
+func extractInboundFeeSafe(data lnwire.ExtraOpaqueData) lnwire.Fee {
+	var inboundFee lnwire.Fee
+
+	_, err := data.ExtractRecords(&inboundFee)
+	if err != nil {
+		// Return zero fee. Do not return the inboundFee variable
+		// because it may be undefined.
+		return lnwire.Fee{}
+	}
+
+	return inboundFee
+}
+
 func marshalDBEdge(edgeInfo *models.ChannelEdgeInfo,
 	c1, c2 *models.ChannelEdgePolicy) *lnrpc.ChannelEdge {
 
@@ -6108,6 +6220,7 @@ func marshalDBRoutingPolicy(
 	disabled := policy.ChannelFlags&lnwire.ChanUpdateDisabled != 0
 
 	customRecords := marshalExtraOpaqueData(policy.ExtraOpaqueData)
+	inboundFee := extractInboundFeeSafe(policy.ExtraOpaqueData)
 
 	return &lnrpc.RoutingPolicy{
 		TimeLockDelta:    uint32(policy.TimeLockDelta),
@@ -6118,6 +6231,9 @@ func marshalDBRoutingPolicy(
 		Disabled:         disabled,
 		LastUpdate:       uint32(policy.LastUpdate.Unix()),
 		CustomRecords:    customRecords,
+
+		InboundFeeBaseMsat:      inboundFee.BaseFee,
+		InboundFeeRateMilliMsat: inboundFee.FeeRate,
 	}
 }
 
@@ -6462,7 +6578,7 @@ func (r *rpcServer) StopDaemon(_ context.Context,
 	// otherwise some funds wouldn't be picked up.
 	isRecoveryMode, progress, err := r.server.cc.Wallet.GetRecoveryInfo()
 	if err != nil {
-		return nil, fmt.Errorf("unable to get wallet recovery info: %v",
+		return nil, fmt.Errorf("unable to get wallet recovery info: %w",
 			err)
 	}
 	if isRecoveryMode && progress < 1 {
@@ -6576,6 +6692,14 @@ func marshallTopologyChange(topChange *routing.TopologyChange) *lnrpc.GraphTopol
 
 	channelUpdates := make([]*lnrpc.ChannelEdgeUpdate, len(topChange.ChannelEdgeUpdates))
 	for i, channelUpdate := range topChange.ChannelEdgeUpdates {
+
+		customRecords := marshalExtraOpaqueData(
+			channelUpdate.ExtraOpaqueData,
+		)
+		inboundFee := extractInboundFeeSafe(
+			channelUpdate.ExtraOpaqueData,
+		)
+
 		channelUpdates[i] = &lnrpc.ChannelEdgeUpdate{
 			ChanId: channelUpdate.ChanID,
 			ChanPoint: &lnrpc.ChannelPoint{
@@ -6586,12 +6710,25 @@ func marshallTopologyChange(topChange *routing.TopologyChange) *lnrpc.GraphTopol
 			},
 			Capacity: int64(channelUpdate.Capacity),
 			RoutingPolicy: &lnrpc.RoutingPolicy{
-				TimeLockDelta:    uint32(channelUpdate.TimeLockDelta),
-				MinHtlc:          int64(channelUpdate.MinHTLC),
-				MaxHtlcMsat:      uint64(channelUpdate.MaxHTLC),
-				FeeBaseMsat:      int64(channelUpdate.BaseFee),
-				FeeRateMilliMsat: int64(channelUpdate.FeeRate),
-				Disabled:         channelUpdate.Disabled,
+				TimeLockDelta: uint32(
+					channelUpdate.TimeLockDelta,
+				),
+				MinHtlc: int64(
+					channelUpdate.MinHTLC,
+				),
+				MaxHtlcMsat: uint64(
+					channelUpdate.MaxHTLC,
+				),
+				FeeBaseMsat: int64(
+					channelUpdate.BaseFee,
+				),
+				FeeRateMilliMsat: int64(
+					channelUpdate.FeeRate,
+				),
+				Disabled:                channelUpdate.Disabled,
+				InboundFeeBaseMsat:      inboundFee.BaseFee,
+				InboundFeeRateMilliMsat: inboundFee.FeeRate,
+				CustomRecords:           customRecords,
 			},
 			AdvertisingNode: encodeKey(channelUpdate.AdvertisingNode),
 			ConnectingNode:  encodeKey(channelUpdate.ConnectingNode),
@@ -6705,6 +6842,27 @@ func (r *rpcServer) DeletePayment(ctx context.Context,
 func (r *rpcServer) DeleteAllPayments(ctx context.Context,
 	req *lnrpc.DeleteAllPaymentsRequest) (
 	*lnrpc.DeleteAllPaymentsResponse, error) {
+
+	switch {
+	// Since this is a destructive operation, at least one of the options
+	// must be set to true.
+	case !req.AllPayments && !req.FailedPaymentsOnly &&
+		!req.FailedHtlcsOnly:
+
+		return nil, fmt.Errorf("at least one of the options " +
+			"`all_payments`, `failed_payments_only`, or " +
+			"`failed_htlcs_only` must be set to true")
+
+	// `all_payments` cannot be true with `failed_payments_only` or
+	// `failed_htlcs_only`. `all_payments` includes all records, making
+	// these options contradictory.
+	case req.AllPayments &&
+		(req.FailedPaymentsOnly || req.FailedHtlcsOnly):
+
+		return nil, fmt.Errorf("`all_payments` cannot be set to true " +
+			"while either `failed_payments_only` or " +
+			"`failed_htlcs_only` is also set to true")
+	}
 
 	rpcsLog.Infof("[DeleteAllPayments] failed_payments_only=%v, "+
 		"failed_htlcs_only=%v", req.FailedPaymentsOnly,
@@ -6856,6 +7014,15 @@ func (r *rpcServer) FeeReport(ctx context.Context,
 				edgePolicy.FeeProportionalMillionths
 			feeRate := float64(feeRateFixedPoint) / feeBase
 
+			// Decode inbound fee from extra data.
+			var inboundFee lnwire.Fee
+			_, err := edgePolicy.ExtraOpaqueData.ExtractRecords(
+				&inboundFee,
+			)
+			if err != nil {
+				return err
+			}
+
 			// TODO(roasbeef): also add stats for revenue for each
 			// channel
 			feeReports = append(feeReports, &lnrpc.ChannelFeeReport{
@@ -6864,6 +7031,9 @@ func (r *rpcServer) FeeReport(ctx context.Context,
 				BaseFeeMsat:  int64(edgePolicy.FeeBaseMSat),
 				FeePerMil:    int64(feeRateFixedPoint),
 				FeeRate:      feeRate,
+
+				InboundBaseFeeMsat: inboundFee.BaseFee,
+				InboundFeePerMil:   inboundFee.FeeRate,
 			})
 
 			return nil
@@ -7046,10 +7216,36 @@ func (r *rpcServer) UpdateChannelPolicy(ctx context.Context,
 			MaxTimeLockDelta)
 	}
 
+	// By default, positive inbound fees are rejected.
+	if !r.cfg.AcceptPositiveInboundFees && req.InboundFee != nil {
+		if req.InboundFee.BaseFeeMsat > 0 {
+			return nil, fmt.Errorf("positive values for inbound "+
+				"base fee msat are not supported: %v",
+				req.InboundFee.BaseFeeMsat)
+		}
+		if req.InboundFee.FeeRatePpm > 0 {
+			return nil, fmt.Errorf("positive values for inbound "+
+				"fee rate ppm are not supported: %v",
+				req.InboundFee.FeeRatePpm)
+		}
+	}
+
+	// If no inbound fees have been specified, we indicate with an empty
+	// option that the previous inbound fee should be retained during the
+	// edge update.
+	inboundFee := fn.None[models.InboundFee]()
+	if req.InboundFee != nil {
+		inboundFee = fn.Some(models.InboundFee{
+			Base: req.InboundFee.BaseFeeMsat,
+			Rate: req.InboundFee.FeeRatePpm,
+		})
+	}
+
 	baseFeeMsat := lnwire.MilliSatoshi(req.BaseFeeMsat)
 	feeSchema := routing.FeeSchema{
-		BaseFee: baseFeeMsat,
-		FeeRate: feeRateFixed,
+		BaseFee:    baseFeeMsat,
+		FeeRate:    feeRateFixed,
+		InboundFee: inboundFee,
 	}
 
 	maxHtlc := lnwire.MilliSatoshi(req.MaxHtlcMsat)
@@ -7144,7 +7340,7 @@ func (r *rpcServer) ForwardingHistory(ctx context.Context,
 	}
 	timeSlice, err := r.server.miscDB.ForwardingLog().Query(eventQuery)
 	if err != nil {
-		return nil, fmt.Errorf("unable to query forwarding log: %v",
+		return nil, fmt.Errorf("unable to query forwarding log: %w",
 			err)
 	}
 
@@ -7946,7 +8142,7 @@ func (r *rpcServer) FundingStateStep(ctx context.Context,
 				false,
 			)
 			if err != nil {
-				return nil, fmt.Errorf("error parsing psbt: %v",
+				return nil, fmt.Errorf("error parsing psbt: %w",
 					err)
 			}
 

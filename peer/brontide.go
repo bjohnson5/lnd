@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,7 @@ import (
 	"github.com/lightningnetwork/lnd/queue"
 	"github.com/lightningnetwork/lnd/subscribe"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/watchtower/wtclient"
 )
 
@@ -75,6 +77,16 @@ const (
 
 	// ErrorBufferSize is the number of historic peer errors that we store.
 	ErrorBufferSize = 10
+
+	// pongSizeCeiling is the upper bound on a uniformly distributed random
+	// variable that we use for requesting pong responses. We don't use the
+	// MaxPongBytes (upper bound accepted by the protocol) because it is
+	// needlessly wasteful of precious Tor bandwidth for little to no gain.
+	pongSizeCeiling = 4096
+
+	// torTimeoutMultiplier is the scaling factor we use on network timeouts
+	// for Tor peers.
+	torTimeoutMultiplier = 3
 )
 
 var (
@@ -364,6 +376,11 @@ type Config struct {
 	// this across multiple Peer struct instances.
 	PongBuf []byte
 
+	// Adds the option to disable forwarding payments in blinded routes
+	// by failing back any blinding-related payloads as if they were
+	// invalid.
+	DisallowRouteBlinding bool
+
 	// Quit is the server's quit channel. If this is closed, we halt operation.
 	Quit chan struct{}
 }
@@ -382,6 +399,23 @@ type Brontide struct {
 	// MUST be used atomically.
 	bytesReceived uint64
 	bytesSent     uint64
+
+	// isTorConnection is a flag that indicates whether or not we believe
+	// the remote peer is a tor connection. It is not always possible to
+	// know this with certainty but we have heuristics we use that should
+	// catch most cases.
+	//
+	// NOTE: We judge the tor-ness of a connection by if the remote peer has
+	// ".onion" in the address OR if it's connected over localhost.
+	// This will miss cases where our peer is connected to our clearnet
+	// address over the tor network (via exit nodes). It will also misjudge
+	// actual localhost connections as tor. We need to include this because
+	// inbound connections to our tor address will appear to come from the
+	// local socks5 proxy. This heuristic is only used to expand the timeout
+	// window for peers so it is OK to misjudge this. If you use this field
+	// for any other purpose you should seriously consider whether or not
+	// this heuristic is good enough for your use case.
+	isTorConnection bool
 
 	pingManager *PingManager
 
@@ -522,6 +556,12 @@ func NewBrontide(cfg Config) *Brontide {
 		log:                build.NewPrefixLog(logPrefix, peerLog),
 	}
 
+	if cfg.Conn != nil && cfg.Conn.RemoteAddr() != nil {
+		remoteAddr := cfg.Conn.RemoteAddr().String()
+		p.isTorConnection = strings.Contains(remoteAddr, ".onion") ||
+			strings.Contains(remoteAddr, "127.0.0.1")
+	}
+
 	var (
 		lastBlockHeader           *wire.BlockHeader
 		lastSerializedBlockHeader [wire.MaxBlockHeaderPayload]byte
@@ -552,25 +592,24 @@ func NewBrontide(cfg Config) *Brontide {
 		return lastSerializedBlockHeader[:]
 	}
 
-	// TODO(roasbeef): make dynamic in order to
-	// create fake cover traffic
-	// NOTE(proofofkeags): this was changed to be
-	// dynamic to allow better pong identification,
-	// however, more thought is needed to make this
-	// actually usable as a traffic decoy
+	// TODO(roasbeef): make dynamic in order to create fake cover traffic.
+	//
+	// NOTE(proofofkeags): this was changed to be dynamic to allow better
+	// pong identification, however, more thought is needed to make this
+	// actually usable as a traffic decoy.
 	randPongSize := func() uint16 {
 		return uint16(
 			// We don't need cryptographic randomness here.
 			/* #nosec */
-			rand.Intn(lnwire.MaxPongBytes + 1),
+			rand.Intn(pongSizeCeiling) + 1,
 		)
 	}
 
 	p.pingManager = NewPingManager(&PingManagerConfig{
 		NewPingPayload:   newPingPayload,
 		NewPongSize:      randPongSize,
-		IntervalDuration: pingInterval,
-		TimeoutDuration:  pingTimeout,
+		IntervalDuration: p.scaleTimeout(pingInterval),
+		TimeoutDuration:  p.scaleTimeout(pingTimeout),
 		SendPing: func(ping *lnwire.Ping) {
 			p.queueMsg(ping, nil)
 		},
@@ -960,12 +999,26 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 		// routing policy into a forwarding policy.
 		var forwardingPolicy *models.ForwardingPolicy
 		if selfPolicy != nil {
+			var inboundWireFee lnwire.Fee
+			_, err := selfPolicy.ExtraOpaqueData.ExtractRecords(
+				&inboundWireFee,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			inboundFee := models.NewInboundFeeFromWire(
+				inboundWireFee,
+			)
+
 			forwardingPolicy = &models.ForwardingPolicy{
 				MinHTLCOut:    selfPolicy.MinHTLC,
 				MaxHTLC:       selfPolicy.MaxHTLC,
 				BaseFee:       selfPolicy.FeeBaseMSat,
 				FeeRate:       selfPolicy.FeeProportionalMillionths,
 				TimeLockDelta: uint32(selfPolicy.TimeLockDelta),
+
+				InboundFee: inboundFee,
 			}
 		} else {
 			p.log.Warnf("Unable to find our forwarding policy "+
@@ -1126,8 +1179,8 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		),
 		BatchSize:               p.cfg.ChannelCommitBatchSize,
 		UnsafeReplay:            p.cfg.UnsafeReplay,
-		MinFeeUpdateTimeout:     htlcswitch.DefaultMinLinkFeeUpdateTimeout,
-		MaxFeeUpdateTimeout:     htlcswitch.DefaultMaxLinkFeeUpdateTimeout,
+		MinUpdateTimeout:        htlcswitch.DefaultMinLinkFeeUpdateTimeout,
+		MaxUpdateTimeout:        htlcswitch.DefaultMaxLinkFeeUpdateTimeout,
 		OutgoingCltvRejectDelta: p.cfg.OutgoingCltvRejectDelta,
 		TowerClient:             p.cfg.TowerClient,
 		MaxOutgoingCltvExpiry:   p.cfg.MaxOutgoingCltvExpiry,
@@ -1140,6 +1193,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		HtlcNotifier:            p.cfg.HtlcNotifier,
 		GetAliases:              p.cfg.GetAliases,
 		PreviouslySentShutdown:  shutdownMsg,
+		DisallowRouteBlinding:   p.cfg.DisallowRouteBlinding,
 	}
 
 	// Before adding our new link, purge the switch of any pending or live
@@ -1231,15 +1285,13 @@ func (p *Brontide) Disconnect(reason error) {
 
 	p.log.Infof(err.Error())
 
+	// Stop PingManager before closing TCP connection.
+	p.pingManager.Stop()
+
 	// Ensure that the TCP connection is properly closed before continuing.
 	p.cfg.Conn.Close()
 
 	close(p.quit)
-
-	if err := p.pingManager.Stop(); err != nil {
-		p.log.Errorf("couldn't stop pingManager during disconnect: %v",
-			err)
-	}
 }
 
 // String returns the string representation of this peer.
@@ -1275,7 +1327,9 @@ func (p *Brontide) readNextMessage() (lnwire.Message, error) {
 		// pool. We do so only after the task has been scheduled to
 		// ensure the deadline doesn't expire while the message is in
 		// the process of being scheduled.
-		readDeadline := time.Now().Add(readMessageTimeout)
+		readDeadline := time.Now().Add(
+			p.scaleTimeout(readMessageTimeout),
+		)
 		readErr := noiseConn.SetReadDeadline(readDeadline)
 		if readErr != nil {
 			return readErr
@@ -1985,8 +2039,19 @@ func messageSummary(msg lnwire.Message) string {
 			msg.FeeSatoshis)
 
 	case *lnwire.UpdateAddHTLC:
-		return fmt.Sprintf("chan_id=%v, id=%v, amt=%v, expiry=%v, hash=%x",
-			msg.ChanID, msg.ID, msg.Amount, msg.Expiry, msg.PaymentHash[:])
+		var blindingPoint []byte
+		msg.BlindingPoint.WhenSome(
+			func(b tlv.RecordT[lnwire.BlindingPointTlvType,
+				*btcec.PublicKey]) {
+
+				blindingPoint = b.Val.SerializeCompressed()
+			},
+		)
+
+		return fmt.Sprintf("chan_id=%v, id=%v, amt=%v, expiry=%v, "+
+			"hash=%x, blinding_point=%x", msg.ChanID, msg.ID,
+			msg.Amount, msg.Expiry, msg.PaymentHash[:],
+			blindingPoint)
 
 	case *lnwire.UpdateFailHTLC:
 		return fmt.Sprintf("chan_id=%v, id=%v, reason=%x", msg.ChanID,
@@ -2146,7 +2211,9 @@ func (p *Brontide) writeMessage(msg lnwire.Message) error {
 	flushMsg := func() error {
 		// Ensure the write deadline is set before we attempt to send
 		// the message.
-		writeDeadline := time.Now().Add(writeMessageTimeout)
+		writeDeadline := time.Now().Add(
+			p.scaleTimeout(writeMessageTimeout),
+		)
 		err := noiseConn.SetWriteDeadline(writeDeadline)
 		if err != nil {
 			return err
@@ -3320,7 +3387,7 @@ func (p *Brontide) handleInitMsg(msg *lnwire.Init) error {
 	// those presented in the local features fields.
 	err := msg.Features.Merge(msg.GlobalFeatures)
 	if err != nil {
-		return fmt.Errorf("unable to merge legacy global features: %v",
+		return fmt.Errorf("unable to merge legacy global features: %w",
 			err)
 	}
 
@@ -4115,4 +4182,16 @@ func (p *Brontide) sendLinkUpdateMsg(cid lnwire.ChannelID, msg lnwire.Message) {
 	// With the stream obtained, add the message to the stream so we can
 	// continue processing message.
 	chanStream.AddMsg(msg)
+}
+
+// scaleTimeout multiplies the argument duration by a constant factor depending
+// on variious heuristics. Currently this is only used to check whether our peer
+// appears to be connected over Tor and relaxes the timout deadline. However,
+// this is subject to change and should be treated as opaque.
+func (p *Brontide) scaleTimeout(timeout time.Duration) time.Duration {
+	if p.isTorConnection {
+		return timeout * time.Duration(torTimeoutMultiplier)
+	}
+
+	return timeout
 }

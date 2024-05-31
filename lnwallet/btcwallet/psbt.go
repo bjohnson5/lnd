@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -60,6 +61,9 @@ var (
 // imported public keys. For custom account, no key scope should be provided
 // as the coin selection key scope will always be used to generate the change
 // address.
+// The function argument `allowUtxo` specifies a filter function for utxos
+// during coin selection. It should return true for utxos that can be used and
+// false for those that should be excluded.
 //
 // NOTE: If the packet doesn't contain any inputs, coin selection is performed
 // automatically. The account parameter must be non-empty as it determines which
@@ -73,7 +77,9 @@ var (
 // This is a part of the WalletController interface.
 func (b *BtcWallet) FundPsbt(packet *psbt.Packet, minConfs int32,
 	feeRate chainfee.SatPerKWeight, accountName string,
-	changeScope *waddrmgr.KeyScope) (int32, error) {
+	changeScope *waddrmgr.KeyScope,
+	strategy wallet.CoinSelectionStrategy,
+	allowUtxo func(wtxmgr.Credit) bool) (int32, error) {
 
 	// The fee rate is passed in using units of sat/kw, so we'll convert
 	// this to sat/KB as the CreateSimpleTx method requires this unit.
@@ -129,12 +135,15 @@ func (b *BtcWallet) FundPsbt(packet *psbt.Packet, minConfs int32,
 	if changeScope != nil {
 		opts = append(opts, wallet.WithCustomChangeScope(changeScope))
 	}
+	if allowUtxo != nil {
+		opts = append(opts, wallet.WithUtxoFilter(allowUtxo))
+	}
 
 	// Let the wallet handle coin selection and/or fee estimation based on
 	// the partial TX information in the packet.
 	return b.wallet.FundPsbt(
 		packet, keyScope, minConfs, accountNum, feeSatPerKB,
-		b.cfg.CoinSelectionStrategy, opts...,
+		strategy, opts...,
 	)
 }
 
@@ -449,7 +458,7 @@ func signSegWitV0(in *psbt.PInput, tx *wire.MsgTx,
 		in.SighashType, privKey,
 	)
 	if err != nil {
-		return fmt.Errorf("error signing input %d: %v", idx, err)
+		return fmt.Errorf("error signing input %d: %w", idx, err)
 	}
 	in.PartialSigs = append(in.PartialSigs, &psbt.PartialSig{
 		PubKey:    pubKeyBytes,
@@ -471,7 +480,7 @@ func signSegWitV1KeySpend(in *psbt.PInput, tx *wire.MsgTx,
 		privKey,
 	)
 	if err != nil {
-		return fmt.Errorf("error signing taproot input %d: %v", idx,
+		return fmt.Errorf("error signing taproot input %d: %w", idx,
 			err)
 	}
 
@@ -491,7 +500,7 @@ func signSegWitV1ScriptSpend(in *psbt.PInput, tx *wire.MsgTx,
 		in.WitnessUtxo.PkScript, leaf, in.SighashType, privKey,
 	)
 	if err != nil {
-		return fmt.Errorf("error signing taproot script input %d: %v",
+		return fmt.Errorf("error signing taproot script input %d: %w",
 			idx, err)
 	}
 

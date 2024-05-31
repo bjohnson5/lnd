@@ -10,6 +10,7 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,6 +26,7 @@ type decodePayloadTest struct {
 	name               string
 	payload            []byte
 	isFinalHop         bool
+	updateAddBlinded   bool
 	expErr             error
 	expCustomRecords   map[uint64][]byte
 	shouldHaveMPP      bool
@@ -270,8 +272,9 @@ var decodePayloadTests = []decodePayloadTest{
 		},
 	},
 	{
-		name:       "intermediate hop with encrypted data",
-		isFinalHop: false,
+		name:             "intermediate hop with encrypted data",
+		isFinalHop:       false,
+		updateAddBlinded: true,
 		payload: []byte{
 			// encrypted data
 			0x0a, 0x03, 0x03, 0x02, 0x01,
@@ -364,8 +367,9 @@ var decodePayloadTests = []decodePayloadTest{
 		shouldHaveTotalAmt: true,
 	},
 	{
-		name:       "final blinded hop with total amount",
-		isFinalHop: true,
+		name:             "final blinded hop with total amount",
+		isFinalHop:       true,
+		updateAddBlinded: true,
 		payload: []byte{
 			// amount
 			0x02, 0x00,
@@ -377,8 +381,9 @@ var decodePayloadTests = []decodePayloadTest{
 		shouldHaveEncData: true,
 	},
 	{
-		name:       "final blinded missing amt",
-		isFinalHop: true,
+		name:             "final blinded missing amt",
+		isFinalHop:       true,
+		updateAddBlinded: true,
 		payload: []byte{
 			// cltv
 			0x04, 0x00,
@@ -393,8 +398,9 @@ var decodePayloadTests = []decodePayloadTest{
 		},
 	},
 	{
-		name:       "final blinded missing cltv",
-		isFinalHop: true,
+		name:             "final blinded missing cltv",
+		isFinalHop:       true,
+		updateAddBlinded: true,
 		payload: []byte{
 			// amount
 			0x02, 0x00,
@@ -409,8 +415,9 @@ var decodePayloadTests = []decodePayloadTest{
 		},
 	},
 	{
-		name:       "intermediate blinded has amount",
-		isFinalHop: false,
+		name:             "intermediate blinded has amount",
+		isFinalHop:       false,
+		updateAddBlinded: true,
 		payload: []byte{
 			// amount
 			0x02, 0x00,
@@ -424,8 +431,9 @@ var decodePayloadTests = []decodePayloadTest{
 		},
 	},
 	{
-		name:       "intermediate blinded has expiry",
-		isFinalHop: false,
+		name:             "intermediate blinded has expiry",
+		isFinalHop:       false,
+		updateAddBlinded: true,
 		payload: []byte{
 			// cltv
 			0x04, 0x00,
@@ -434,6 +442,67 @@ var decodePayloadTests = []decodePayloadTest{
 		},
 		expErr: hop.ErrInvalidPayload{
 			Type:      record.LockTimeOnionType,
+			Violation: hop.IncludedViolation,
+			FinalHop:  false,
+		},
+	},
+	{
+		name:       "update add blinding no data",
+		isFinalHop: false,
+		payload: []byte{
+			// cltv
+			0x04, 0x00,
+		},
+		updateAddBlinded: true,
+		expErr: hop.ErrInvalidPayload{
+			Type:      record.EncryptedDataOnionType,
+			Violation: hop.OmittedViolation,
+			FinalHop:  false,
+		},
+	},
+	{
+		name:       "onion blinding point no data",
+		isFinalHop: false,
+		payload: append([]byte{
+			// blinding point (type / length)
+			0x0c, 0x21,
+		},
+			// blinding point (value)
+			testPubKey.SerializeCompressed()...,
+		),
+		expErr: hop.ErrInvalidPayload{
+			Type:      record.EncryptedDataOnionType,
+			Violation: hop.OmittedViolation,
+			FinalHop:  false,
+		},
+	},
+	{
+		name:       "encrypted data no blinding",
+		isFinalHop: false,
+		payload: []byte{
+			// encrypted data
+			0x0a, 0x03, 0x03, 0x02, 0x01,
+		},
+		expErr: hop.ErrInvalidPayload{
+			Type:      record.EncryptedDataOnionType,
+			Violation: hop.IncludedViolation,
+		},
+	},
+	{
+		name:             "both blinding points",
+		isFinalHop:       false,
+		updateAddBlinded: true,
+		payload: append([]byte{
+			// encrypted data
+			0x0a, 0x03, 0x03, 0x02, 0x01,
+			// blinding point (type / length)
+			0x0c, 0x21,
+		},
+			// blinding point (value)
+			testPubKey.SerializeCompressed()...,
+		),
+		expErr: hop.ErrInvalidPayload{
+			Type:      record.BlindingPointOnionType,
 			Violation: hop.IncludedViolation,
 			FinalHop:  false,
 		},
@@ -478,8 +547,13 @@ func testDecodeHopPayloadValidation(t *testing.T, test decodePayloadTest) {
 		testChildIndex = uint32(9)
 	)
 
-	p, err := hop.NewPayloadFromReader(
-		bytes.NewReader(test.payload), test.isFinalHop,
+	p, parsedTypes, err := hop.ParseTLVPayload(
+		bytes.NewReader(test.payload),
+	)
+	require.NoError(t, err)
+
+	err = hop.ValidateTLVPayload(
+		parsedTypes, test.isFinalHop, test.updateAddBlinded,
 	)
 	if !reflect.DeepEqual(test.expErr, err) {
 		t.Fatalf("expected error mismatch, want: %v, got: %v",
@@ -555,5 +629,207 @@ func testDecodeHopPayloadValidation(t *testing.T, test decodePayloadTest) {
 	}
 	if !reflect.DeepEqual(expCustomRecords, p.CustomRecords()) {
 		t.Fatalf("invalid custom records")
+	}
+}
+
+// TestValidateBlindedRouteData tests validation of the values provided in a
+// blinded route.
+func TestValidateBlindedRouteData(t *testing.T) {
+	scid := lnwire.NewShortChanIDFromInt(1)
+
+	tests := []struct {
+		name             string
+		data             *record.BlindedRouteData
+		incomingAmount   lnwire.MilliSatoshi
+		incomingTimelock uint32
+		err              error
+	}{
+		{
+			name: "max cltv expired",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{},
+				&record.PaymentConstraints{
+					MaxCltvExpiry: 100,
+				},
+				nil,
+			),
+			incomingTimelock: 200,
+			err: hop.ErrInvalidPayload{
+				Type:      record.LockTimeOnionType,
+				Violation: hop.InsufficientViolation,
+			},
+		},
+		{
+			name: "zero max cltv",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{},
+				&record.PaymentConstraints{
+					MaxCltvExpiry:   0,
+					HtlcMinimumMsat: 10,
+				},
+				nil,
+			),
+			incomingAmount:   100,
+			incomingTimelock: 10,
+			err: hop.ErrInvalidPayload{
+				Type:      record.LockTimeOnionType,
+				Violation: hop.InsufficientViolation,
+			},
+		},
+		{
+			name: "amount below minimum",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{},
+				&record.PaymentConstraints{
+					HtlcMinimumMsat: 15,
+				},
+				nil,
+			),
+			incomingAmount: 10,
+			err: hop.ErrInvalidPayload{
+				Type:      record.AmtOnionType,
+				Violation: hop.InsufficientViolation,
+			},
+		},
+		{
+			name: "valid, no features",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{},
+				&record.PaymentConstraints{
+					MaxCltvExpiry:   100,
+					HtlcMinimumMsat: 20,
+				},
+				nil,
+			),
+			incomingAmount:   40,
+			incomingTimelock: 80,
+		},
+		{
+			name: "unknown features",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{},
+				&record.PaymentConstraints{
+					MaxCltvExpiry:   100,
+					HtlcMinimumMsat: 20,
+				},
+				lnwire.NewFeatureVector(
+					lnwire.NewRawFeatureVector(
+						lnwire.FeatureBit(9999),
+					),
+					lnwire.Features,
+				),
+			),
+			incomingAmount:   40,
+			incomingTimelock: 80,
+			err: hop.ErrInvalidPayload{
+				Type:      14,
+				Violation: hop.IncludedViolation,
+			},
+		},
+		{
+			name: "valid data",
+			data: record.NewBlindedRouteData(
+				scid,
+				nil,
+				record.PaymentRelayInfo{
+					CltvExpiryDelta: 10,
+					FeeRate:         10,
+					BaseFee:         100,
+				},
+				&record.PaymentConstraints{
+					MaxCltvExpiry:   100,
+					HtlcMinimumMsat: 20,
+				},
+				nil,
+			),
+			incomingAmount:   40,
+			incomingTimelock: 80,
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+
+		t.Run(testCase.name, func(t *testing.T) {
+			err := hop.ValidateBlindedRouteData(
+				testCase.data, testCase.incomingAmount,
+				testCase.incomingTimelock,
+			)
+			require.Equal(t, testCase.err, err)
+		})
+	}
+}
+
+// TestValidatePayloadWithBlinded tests validation of the contents of a
+// payload when it's for a blinded payment.
+func TestValidatePayloadWithBlinded(t *testing.T) {
+	t.Parallel()
+
+	finalHopMap := map[tlv.Type][]byte{
+		record.AmtOnionType:            nil,
+		record.LockTimeOnionType:       nil,
+		record.TotalAmtMsatBlindedType: nil,
+	}
+
+	tests := []struct {
+		name    string
+		isFinal bool
+		parsed  map[tlv.Type][]byte
+		err     bool
+	}{
+		{
+			name:    "final hop, valid",
+			isFinal: true,
+			parsed:  finalHopMap,
+		},
+		{
+			name:    "intermediate hop, invalid",
+			isFinal: false,
+			parsed:  finalHopMap,
+			err:     true,
+		},
+		{
+			name:    "intermediate hop, invalid",
+			isFinal: false,
+			parsed: map[tlv.Type][]byte{
+				record.EncryptedDataOnionType: nil,
+				record.BlindingPointOnionType: nil,
+			},
+		},
+		{
+			name:    "unknown record, invalid",
+			isFinal: false,
+			parsed: map[tlv.Type][]byte{
+				tlv.Type(99): nil,
+			},
+			err: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := hop.ValidatePayloadWithBlinded(
+				testCase.isFinal, testCase.parsed,
+			)
+
+			// We can't determine our exact error because we
+			// iterate through a map (non-deterministic) in the
+			// function.
+			if testCase.err {
+				require.NotNil(t, err)
+			} else {
+				require.Nil(t, err)
+			}
+		})
 	}
 }

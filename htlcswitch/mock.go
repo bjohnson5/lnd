@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -81,6 +80,7 @@ func (m *mockPreimageCache) SubscribeUpdates(
 	return nil, nil
 }
 
+// TODO(yy): replace it with chainfee.MockEstimator.
 type mockFeeEstimator struct {
 	byteFeeIn chan chainfee.SatPerKWeight
 	relayFee  chan chainfee.SatPerKWeight
@@ -330,10 +330,10 @@ func newMockHopIterator(hops ...*hop.Payload) hop.Iterator {
 	return &mockHopIterator{hops: hops}
 }
 
-func (r *mockHopIterator) HopPayload() (*hop.Payload, error) {
+func (r *mockHopIterator) HopPayload() (*hop.Payload, hop.RouteRole, error) {
 	h := r.hops[0]
 	r.hops = r.hops[1:]
-	return h, nil
+	return h, hop.RouteRoleCleartext, nil
 }
 
 func (r *mockHopIterator) ExtraOnionBlob() []byte {
@@ -341,7 +341,7 @@ func (r *mockHopIterator) ExtraOnionBlob() []byte {
 }
 
 func (r *mockHopIterator) ExtractErrorEncrypter(
-	extracter hop.ErrorEncrypterExtracter) (hop.ErrorEncrypter,
+	extracter hop.ErrorEncrypterExtracter, _ bool) (hop.ErrorEncrypter,
 	lnwire.FailCode) {
 
 	return extracter(nil)
@@ -834,7 +834,7 @@ func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
 func (f *mockChannelLink) UpdateForwardingPolicy(_ models.ForwardingPolicy) {
 }
 func (f *mockChannelLink) CheckHtlcForward([32]byte, lnwire.MilliSatoshi,
-	lnwire.MilliSatoshi, uint32, uint32, uint32,
+	lnwire.MilliSatoshi, uint32, uint32, models.InboundFee, uint32,
 	lnwire.ShortChannelID) *LinkError {
 
 	return f.checkHtlcForwardResult
@@ -946,7 +946,7 @@ var _ ChannelLink = (*mockChannelLink)(nil)
 func newDB() (*channeldb.DB, func(), error) {
 	// First, create a temporary directory to be used for the duration of
 	// this test.
-	tempDirName, err := ioutil.TempDir("", "channeldb")
+	tempDirName, err := os.MkdirTemp("", "channeldb")
 	if err != nil {
 		return nil, nil, err
 	}

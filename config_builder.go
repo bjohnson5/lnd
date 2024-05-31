@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -331,7 +330,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	case d.cfg.WalletUnlockPasswordFile != "" && walletExists:
 		d.logger.Infof("Attempting automatic wallet unlock with " +
 			"password provided in file")
-		pwBytes, err := ioutil.ReadFile(d.cfg.WalletUnlockPasswordFile)
+		pwBytes, err := os.ReadFile(d.cfg.WalletUnlockPasswordFile)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("error reading "+
 				"password from file %s: %v",
@@ -553,6 +552,11 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		NeutrinoCS:                  neutrinoCS,
 		ActiveNetParams:             d.cfg.ActiveNetParams,
 		FeeURL:                      d.cfg.FeeURL,
+		Fee: &lncfg.Fee{
+			URL:              d.cfg.Fee.URL,
+			MinUpdateTimeout: d.cfg.Fee.MinUpdateTimeout,
+			MaxUpdateTimeout: d.cfg.Fee.MaxUpdateTimeout,
+		},
 		Dialer: func(addr string) (net.Conn, error) {
 			return d.cfg.net.Dial(
 				"tcp", addr, d.cfg.ConnectionTimeout,
@@ -570,7 +574,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	)
 	cleanUpTasks = append(cleanUpTasks, pccCleanup)
 	if err != nil {
-		err := fmt.Errorf("unable to create partial chain control: %v",
+		err := fmt.Errorf("unable to create partial chain control: %w",
 			err)
 		d.logger.Error(err)
 		return nil, nil, nil, err
@@ -1055,12 +1059,12 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 
 		executor := sqldb.NewTransactionExecutor(
 			dbs.NativeSQLStore,
-			func(tx *sql.Tx) sqldb.InvoiceQueries {
+			func(tx *sql.Tx) invoices.SQLInvoiceQueries {
 				return dbs.NativeSQLStore.WithTx(tx)
 			},
 		)
 
-		dbs.InvoiceDB = sqldb.NewInvoiceStore(
+		dbs.InvoiceDB = invoices.NewSQLStore(
 			executor, clock.NewDefaultClock(),
 		)
 	} else {
@@ -1075,7 +1079,7 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 		if err != nil {
 			cleanUp()
 
-			err := fmt.Errorf("unable to open %s database: %v",
+			err := fmt.Errorf("unable to open %s database: %w",
 				lncfg.NSTowerClientDB, err)
 			d.logger.Error(err)
 			return nil, nil, err
@@ -1090,7 +1094,7 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 		if err != nil {
 			cleanUp()
 
-			err := fmt.Errorf("unable to open %s database: %v",
+			err := fmt.Errorf("unable to open %s database: %w",
 				lncfg.NSTowerServerDB, err)
 			d.logger.Error(err)
 			return nil, nil, err
@@ -1305,7 +1309,7 @@ func importWatchOnlyAccounts(wallet *wallet.Wallet,
 			addrSchema,
 		)
 		if err != nil {
-			return fmt.Errorf("could not import account %v: %v",
+			return fmt.Errorf("could not import account %v: %w",
 				name, err)
 		}
 	}

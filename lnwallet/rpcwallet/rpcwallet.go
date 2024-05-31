@@ -7,7 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -121,11 +121,11 @@ func (r *RPCKeyRing) NewAddress(addrType lnwallet.AddressType, change bool,
 //
 // NOTE: This method only signs with BIP49/84 keys.
 func (r *RPCKeyRing) SendOutputs(outputs []*wire.TxOut,
-	feeRate chainfee.SatPerKWeight, minConfs int32,
-	label string) (*wire.MsgTx, error) {
+	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+	strategy basewallet.CoinSelectionStrategy) (*wire.MsgTx, error) {
 
 	tx, err := r.WalletController.SendOutputs(
-		outputs, feeRate, minConfs, label,
+		outputs, feeRate, minConfs, label, strategy,
 	)
 	if err != nil && err != basewallet.ErrTxUnsigned {
 		return nil, err
@@ -533,12 +533,12 @@ func (r *RPCKeyRing) SignMessageSchnorr(keyLoc keychain.KeyLocator,
 	if err != nil {
 		considerShutdown(err)
 		return nil, fmt.Errorf("error signing message in remote "+
-			"signer instance: %v", err)
+			"signer instance: %w", err)
 	}
 
 	sigParsed, err := schnorr.ParseSignature(resp.Signature)
 	if err != nil {
-		return nil, fmt.Errorf("can't parse schnorr signature: %v",
+		return nil, fmt.Errorf("can't parse schnorr signature: %w",
 			err)
 	}
 	return sigParsed, nil
@@ -634,7 +634,7 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	// input.
 	sig, err := r.remoteSign(tx, signDesc, witnessProgram)
 	if err != nil {
-		return nil, fmt.Errorf("error signing with remote instance: %v",
+		return nil, fmt.Errorf("error signing with remote instance: %w",
 			err)
 	}
 
@@ -740,7 +740,7 @@ func (r *RPCKeyRing) MuSig2CreateSession(bipVersion input.MuSig2Version,
 			resp.TaprootInternalKey,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing internal key: %v",
+			return nil, fmt.Errorf("error parsing internal key: %w",
 				err)
 		}
 	}
@@ -1259,9 +1259,9 @@ func extractSignature(in *psbt.PInput,
 func connectRPC(hostPort, tlsCertPath, macaroonPath string,
 	timeout time.Duration) (*grpc.ClientConn, error) {
 
-	certBytes, err := ioutil.ReadFile(tlsCertPath)
+	certBytes, err := os.ReadFile(tlsCertPath)
 	if err != nil {
-		return nil, fmt.Errorf("error reading TLS cert file %v: %v",
+		return nil, fmt.Errorf("error reading TLS cert file %v: %w",
 			tlsCertPath, err)
 	}
 
@@ -1271,9 +1271,9 @@ func connectRPC(hostPort, tlsCertPath, macaroonPath string,
 			"certificate")
 	}
 
-	macBytes, err := ioutil.ReadFile(macaroonPath)
+	macBytes, err := os.ReadFile(macaroonPath)
 	if err != nil {
-		return nil, fmt.Errorf("error reading macaroon file %v: %v",
+		return nil, fmt.Errorf("error reading macaroon file %v: %w",
 			macaroonPath, err)
 	}
 	mac := &macaroon.Macaroon{}
@@ -1297,7 +1297,7 @@ func connectRPC(hostPort, tlsCertPath, macaroonPath string,
 	defer cancel()
 	conn, err := grpc.DialContext(ctxt, hostPort, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("unable to connect to RPC server: %v",
+		return nil, fmt.Errorf("unable to connect to RPC server: %w",
 			err)
 	}
 

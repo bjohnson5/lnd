@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -30,6 +29,8 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/labels"
@@ -287,7 +288,7 @@ func New(cfg *Config) (*WalletKit, lnrpc.MacaroonPerms, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		err = ioutil.WriteFile(macFilePath, walletKitMacBytes, 0644)
+		err = os.WriteFile(macFilePath, walletKitMacBytes, 0644)
 		if err != nil {
 			_ = os.Remove(macFilePath)
 			return nil, nil, err
@@ -799,12 +800,19 @@ func (w *WalletKit) SendOutputs(ctx context.Context,
 		return nil, err
 	}
 
+	coinSelectionStrategy, err := lnrpc.UnmarshallCoinSelectionStrategy(
+		req.CoinSelectionStrategy, w.cfg.CoinSelectionStrategy,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Now that we have the outputs mapped and checked for the reserve
 	// requirement, we can request that the wallet attempts to create this
 	// transaction.
 	tx, err := w.cfg.Wallet.SendOutputs(
 		outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw), minConfs,
-		label,
+		label, coinSelectionStrategy,
 	)
 	if err != nil {
 		return nil, err
@@ -856,41 +864,44 @@ func (w *WalletKit) PendingSweeps(ctx context.Context,
 
 	// Retrieve all of the outputs the UtxoSweeper is currently trying to
 	// sweep.
-	pendingInputs, err := w.cfg.Sweeper.PendingInputs()
+	inputsMap, err := w.cfg.Sweeper.PendingInputs()
 	if err != nil {
 		return nil, err
 	}
 
 	// Convert them into their respective RPC format.
-	rpcPendingSweeps := make([]*PendingSweep, 0, len(pendingInputs))
-	for _, pendingInput := range pendingInputs {
-		witnessType, ok := allWitnessTypes[pendingInput.WitnessType]
+	rpcPendingSweeps := make([]*PendingSweep, 0, len(inputsMap))
+	for _, inp := range inputsMap {
+		witnessType, ok := allWitnessTypes[inp.WitnessType]
 		if !ok {
 			return nil, fmt.Errorf("unhandled witness type %v for "+
-				"input %v", pendingInput.WitnessType,
-				pendingInput.OutPoint)
+				"input %v", inp.WitnessType, inp.OutPoint)
 		}
 
-		op := lnrpc.MarshalOutPoint(&pendingInput.OutPoint)
-		amountSat := uint32(pendingInput.Amount)
-		satPerVbyte := uint64(pendingInput.LastFeeRate.FeePerVByte())
-		broadcastAttempts := uint32(pendingInput.BroadcastAttempts)
-		nextBroadcastHeight := uint32(pendingInput.NextBroadcastHeight)
+		op := lnrpc.MarshalOutPoint(&inp.OutPoint)
+		amountSat := uint32(inp.Amount)
+		satPerVbyte := uint64(inp.LastFeeRate.FeePerVByte())
+		broadcastAttempts := uint32(inp.BroadcastAttempts)
 
-		requestedFee := pendingInput.Params.Fee
-		requestedFeeRate := uint64(requestedFee.FeeRate.FeePerVByte())
+		// Get the requested starting fee rate, if set.
+		startingFeeRate := fn.MapOptionZ(
+			inp.Params.StartingFeeRate,
+			func(feeRate chainfee.SatPerKWeight) uint64 {
+				return uint64(feeRate.FeePerVByte())
+			})
 
-		rpcPendingSweeps = append(rpcPendingSweeps, &PendingSweep{
+		ps := &PendingSweep{
 			Outpoint:             op,
 			WitnessType:          witnessType,
 			AmountSat:            amountSat,
 			SatPerVbyte:          satPerVbyte,
 			BroadcastAttempts:    broadcastAttempts,
-			NextBroadcastHeight:  nextBroadcastHeight,
-			RequestedSatPerVbyte: requestedFeeRate,
-			RequestedConfTarget:  requestedFee.ConfTarget,
-			Force:                pendingInput.Params.Force,
-		})
+			Immediate:            inp.Params.Immediate,
+			Budget:               uint64(inp.Params.Budget),
+			DeadlineHeight:       inp.DeadlineHeight,
+			RequestedSatPerVbyte: startingFeeRate,
+		}
+		rpcPendingSweeps = append(rpcPendingSweeps, ps)
 	}
 
 	return &PendingSweepsResponse{
@@ -931,6 +942,131 @@ func UnmarshallOutPoint(op *lnrpc.OutPoint) (*wire.OutPoint, error) {
 	}, nil
 }
 
+// validateBumpFeeRequest makes sure the deprecated fields are not used when
+// the new fields are set.
+func validateBumpFeeRequest(in *BumpFeeRequest) (
+	fn.Option[chainfee.SatPerKWeight], bool, error) {
+
+	// Get the specified fee rate if set.
+	satPerKwOpt := fn.None[chainfee.SatPerKWeight]()
+
+	// We only allow using either the deprecated field or the new field.
+	switch {
+	case in.SatPerByte != 0 && in.SatPerVbyte != 0:
+		return satPerKwOpt, false, fmt.Errorf("either SatPerByte or " +
+			"SatPerVbyte should be set, but not both")
+
+	case in.SatPerByte != 0:
+		satPerKw := chainfee.SatPerVByte(
+			in.SatPerByte,
+		).FeePerKWeight()
+		satPerKwOpt = fn.Some(satPerKw)
+
+	case in.SatPerVbyte != 0:
+		satPerKw := chainfee.SatPerVByte(
+			in.SatPerVbyte,
+		).FeePerKWeight()
+		satPerKwOpt = fn.Some(satPerKw)
+	}
+
+	var immediate bool
+	switch {
+	case in.Force && in.Immediate:
+		return satPerKwOpt, false, fmt.Errorf("either Force or " +
+			"Immediate should be set, but not both")
+
+	case in.Force:
+		immediate = in.Force
+
+	case in.Immediate:
+		immediate = in.Immediate
+	}
+
+	return satPerKwOpt, immediate, nil
+}
+
+// prepareSweepParams creates the sweep params to be used for the sweeper. It
+// returns the new params and a bool indicating whether this is an existing
+// input.
+func (w *WalletKit) prepareSweepParams(in *BumpFeeRequest,
+	op wire.OutPoint, currentHeight int32) (sweep.Params, bool, error) {
+
+	// Return an error if both deprecated and new fields are used.
+	feerate, immediate, err := validateBumpFeeRequest(in)
+	if err != nil {
+		return sweep.Params{}, false, err
+	}
+
+	// Get the current pending inputs.
+	inputMap, err := w.cfg.Sweeper.PendingInputs()
+	if err != nil {
+		return sweep.Params{}, false, fmt.Errorf("unable to get "+
+			"pending inputs: %w", err)
+	}
+
+	// Find the pending input.
+	//
+	// TODO(yy): act differently based on the state of the input?
+	inp, ok := inputMap[op]
+
+	if !ok {
+		// NOTE: if this input doesn't exist and the new budget is not
+		// specified, the params would have a zero budget.
+		params := sweep.Params{
+			Immediate:       immediate,
+			StartingFeeRate: feerate,
+			Budget:          btcutil.Amount(in.Budget),
+		}
+		if in.TargetConf != 0 {
+			params.DeadlineHeight = fn.Some(
+				int32(in.TargetConf) + currentHeight,
+			)
+		}
+
+		return params, ok, nil
+	}
+
+	// Find the existing budget used for this input. Note that this value
+	// must be greater than zero.
+	budget := inp.Params.Budget
+
+	// Set the new budget if specified.
+	if in.Budget != 0 {
+		budget = btcutil.Amount(in.Budget)
+	}
+
+	// For an existing input, we assign it first, then overwrite it if
+	// a deadline is requested.
+	deadline := inp.Params.DeadlineHeight
+
+	// Set the deadline if target conf is specified.
+	//
+	// TODO(yy): upgrade `falafel` so we can make this field optional. Atm
+	// we cannot distinguish between user's not setting the field and
+	// setting it to 0.
+	if in.TargetConf != 0 {
+		deadline = fn.Some(int32(in.TargetConf) + currentHeight)
+	}
+
+	// Prepare the new sweep params.
+	//
+	// NOTE: if this input doesn't exist and the new budget is not
+	// specified, the params would have a zero budget.
+	params := sweep.Params{
+		Immediate:       immediate,
+		StartingFeeRate: feerate,
+		DeadlineHeight:  deadline,
+		Budget:          budget,
+	}
+
+	if ok {
+		log.Infof("[BumpFee]: bumping fee for existing input=%v, old "+
+			"params=%v, new params=%v", op, inp.Params, params)
+	}
+
+	return params, ok, nil
+}
+
 // BumpFee allows bumping the fee rate of an arbitrary input. A fee preference
 // can be expressed either as a specific fee rate or a delta of blocks in which
 // the output should be swept on-chain within. If a fee preference is not
@@ -945,65 +1081,80 @@ func (w *WalletKit) BumpFee(ctx context.Context,
 		return nil, err
 	}
 
-	// We only allow using either the deprecated field or the new field.
-	if in.SatPerByte != 0 && in.SatPerVbyte != 0 {
-		return nil, fmt.Errorf("either SatPerByte or " +
-			"SatPerVbyte should be set, but not both")
+	// Get the current height so we can calculate the deadline height.
+	_, currentHeight, err := w.cfg.Chain.GetBestBlock()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve current height: %w",
+			err)
 	}
 
-	// Construct the request's fee preference.
-	satPerKw := chainfee.SatPerKVByte(in.SatPerVbyte * 1000).FeePerKWeight()
-	if in.SatPerByte != 0 {
-		satPerKw = chainfee.SatPerKVByte(
-			in.SatPerByte * 1000,
-		).FeePerKWeight()
-	}
-	feePreference := sweep.FeePreference{
-		ConfTarget: uint32(in.TargetConf),
-		FeeRate:    satPerKw,
-	}
-
-	// We'll attempt to bump the fee of the input through the UtxoSweeper.
-	// If it is currently attempting to sweep the input, then it'll simply
-	// bump its fee, which will result in a replacement transaction (RBF)
-	// being broadcast. If it is not aware of the input however,
-	// lnwallet.ErrNotMine is returned.
-	params := sweep.ParamsUpdate{
-		Fee:   feePreference,
-		Force: in.Force,
-	}
-
-	_, err = w.cfg.Sweeper.UpdateParams(*op, params)
-	switch err {
-	case nil:
-		return &BumpFeeResponse{
-			Status: "Successfully registered rbf-tx with sweeper",
-		}, nil
-	case lnwallet.ErrNotMine:
-		break
-	default:
+	// We now create a new sweeping params and update it in the sweeper.
+	// This will complicate the RBF conditions if this input has already
+	// been offered to sweeper before and it has already been included in a
+	// tx with other inputs. If this is the case, two results are possible:
+	// - either this input successfully RBFed the existing tx, or,
+	// - the budget of this input was not enough to RBF the existing tx.
+	params, existing, err := w.prepareSweepParams(in, *op, currentHeight)
+	if err != nil {
 		return nil, err
 	}
 
-	log.Debugf("Attempting to CPFP outpoint %s", op)
+	// If this input exists, we will update its params.
+	if existing {
+		_, err = w.cfg.Sweeper.UpdateParams(*op, params)
+		if err != nil {
+			return nil, err
+		}
 
-	// Since we're unable to perform a bump through RBF, we'll assume the
-	// user is attempting to bump an unconfirmed transaction's fee rate by
+		return &BumpFeeResponse{
+			Status: "Successfully registered rbf-tx with sweeper",
+		}, nil
+	}
+
+	// Otherwise, create a new sweeping request for this input.
+	err = w.sweepNewInput(op, uint32(currentHeight), params)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BumpFeeResponse{
+		Status: "Successfully registered CPFP-tx with the sweeper",
+	}, nil
+}
+
+// sweepNewInput handles the case where an input is seen the first time by the
+// sweeper. It will fetch the output from the wallet and construct an input and
+// offer it to the sweeper.
+//
+// NOTE: if the budget is not set, the default budget ratio is used.
+func (w *WalletKit) sweepNewInput(op *wire.OutPoint, currentHeight uint32,
+	params sweep.Params) error {
+
+	log.Debugf("Attempting to sweep outpoint %s", op)
+
+	// Since the sweeper is not aware of the input, we'll assume the user
+	// is attempting to bump an unconfirmed transaction's fee rate by
 	// sweeping an output within it under control of the wallet with a
-	// higher fee rate, essentially performing a Child-Pays-For-Parent
-	// (CPFP).
+	// higher fee rate. In this case, this will be a CPFP.
 	//
 	// We'll gather all of the information required by the UtxoSweeper in
 	// order to sweep the output.
 	utxo, err := w.cfg.Wallet.FetchInputInfo(op)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// We're only able to bump the fee of unconfirmed transactions.
 	if utxo.Confirmations > 0 {
-		return nil, errors.New("unable to bump fee of a confirmed " +
+		return errors.New("unable to bump fee of a confirmed " +
 			"transaction")
+	}
+
+	// If there's no budget set, use the default value.
+	if params.Budget == 0 {
+		params.Budget = utxo.Value.MulF64(
+			contractcourt.DefaultBudgetRatio,
+		)
 	}
 
 	signDesc := &input.SignDescriptor{
@@ -1024,29 +1175,18 @@ func (w *WalletKit) BumpFee(ctx context.Context,
 		witnessType = input.TaprootPubKeySpend
 		signDesc.HashType = txscript.SigHashDefault
 	default:
-		return nil, fmt.Errorf("unknown input witness %v", op)
+		return fmt.Errorf("unknown input witness %v", op)
 	}
 
-	// We'll use the current height as the height hint since we're dealing
-	// with an unconfirmed transaction.
-	_, currentHeight, err := w.cfg.Chain.GetBestBlock()
-	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve current height: %v",
-			err)
+	log.Infof("[BumpFee]: bumping fee for new input=%v, params=%v", op,
+		params)
+
+	inp := input.NewBaseInput(op, witnessType, signDesc, currentHeight)
+	if _, err = w.cfg.Sweeper.SweepInput(inp, params); err != nil {
+		return err
 	}
 
-	inp := input.NewBaseInput(
-		op, witnessType, signDesc, uint32(currentHeight),
-	)
-
-	sweepParams := sweep.Params{Fee: feePreference}
-	if _, err = w.cfg.Sweeper.SweepInput(inp, sweepParams); err != nil {
-		return nil, err
-	}
-
-	return &BumpFeeResponse{
-		Status: "Successfully registered cpfp-tx with the sweeper",
-	}, nil
+	return nil
 }
 
 // ListSweeps returns a list of the sweeps that our node has published.
@@ -1173,12 +1313,15 @@ func (w *WalletKit) LabelTransaction(ctx context.Context,
 func (w *WalletKit) FundPsbt(_ context.Context,
 	req *FundPsbtRequest) (*FundPsbtResponse, error) {
 
-	var (
-		err         error
-		feeSatPerKW chainfee.SatPerKWeight
+	coinSelectionStrategy, err := lnrpc.UnmarshallCoinSelectionStrategy(
+		req.CoinSelectionStrategy, w.cfg.CoinSelectionStrategy,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Determine the desired transaction fee.
+	var feeSatPerKW chainfee.SatPerKWeight
 	switch {
 	// Estimate the fee by the target number of blocks to confirmation.
 	case req.GetTargetConf() != 0:
@@ -1241,7 +1384,7 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 		// wallet.
 		return w.fundPsbtInternalWallet(
 			account, keyScopeFromChangeAddressType(req.ChangeType),
-			packet, minConfs, feeSatPerKW,
+			packet, minConfs, feeSatPerKW, coinSelectionStrategy,
 		)
 
 	// The template is specified as a PSBT with the intention to perform
@@ -1317,7 +1460,7 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 		// coin selection algorithm.
 		return w.fundPsbtCoinSelect(
 			account, changeIndex, packet, minConfs, changeType,
-			feeSatPerKW,
+			feeSatPerKW, coinSelectionStrategy,
 		)
 
 	// The template is specified as a RPC message. We need to create a new
@@ -1374,7 +1517,7 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 		// wallet.
 		return w.fundPsbtInternalWallet(
 			account, keyScopeFromChangeAddressType(req.ChangeType),
-			packet, minConfs, feeSatPerKW,
+			packet, minConfs, feeSatPerKW, coinSelectionStrategy,
 		)
 
 	default:
@@ -1387,7 +1530,8 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 // wallet that does not allow specifying custom inputs while selecting coins.
 func (w *WalletKit) fundPsbtInternalWallet(account string,
 	keyScope *waddrmgr.KeyScope, packet *psbt.Packet, minConfs int32,
-	feeSatPerKW chainfee.SatPerKWeight) (*FundPsbtResponse, error) {
+	feeSatPerKW chainfee.SatPerKWeight,
+	strategy base.CoinSelectionStrategy) (*FundPsbtResponse, error) {
 
 	// The RPC parsing part is now over. Several of the following operations
 	// require us to hold the global coin selection lock, so we do the rest
@@ -1406,12 +1550,73 @@ func (w *WalletKit) fundPsbtInternalWallet(account string,
 				return err
 			}
 
+			// filterFn makes sure utxos which are unconfirmed and
+			// still used by the sweeper are not used.
+			filterFn := func(u *lnwallet.Utxo) bool {
+				// Confirmed utxos are always allowed.
+				if u.Confirmations > 0 {
+					return true
+				}
+
+				// Unconfirmed utxos in use by the sweeper are
+				// not stable to use because they can be
+				// replaced.
+				if w.cfg.Sweeper.IsSweeperOutpoint(u.OutPoint) {
+					log.Warnf("Cannot use unconfirmed "+
+						"utxo=%v because it is "+
+						"unstable and could be "+
+						"replaced", u.OutPoint)
+
+					return false
+				}
+
+				return true
+			}
+
+			eligibleUtxos := fn.Filter(filterFn, utxos)
+
 			// Validate all inputs against our known list of UTXOs
 			// now.
-			err = verifyInputsUnspent(packet.UnsignedTx.TxIn, utxos)
+			err = verifyInputsUnspent(
+				packet.UnsignedTx.TxIn, eligibleUtxos,
+			)
 			if err != nil {
 				return err
 			}
+		}
+
+		// currentHeight is needed to determine whether the internal
+		// wallet utxo is still unconfirmed.
+		_, currentHeight, err := w.cfg.Chain.GetBestBlock()
+		if err != nil {
+			return fmt.Errorf("unable to retrieve current "+
+				"height: %v", err)
+		}
+
+		// restrictUnstableUtxos is a filter function which disallows
+		// the usage of unconfirmed outputs published (still in use) by
+		// the sweeper.
+		restrictUnstableUtxos := func(utxo wtxmgr.Credit) bool {
+			// Wallet utxos which are unmined have a height
+			// of -1.
+			if utxo.Height != -1 && utxo.Height <= currentHeight {
+				// Confirmed utxos are always allowed.
+				return true
+			}
+
+			// Utxos used by the sweeper are not used for
+			// channel openings.
+			allowed := !w.cfg.Sweeper.IsSweeperOutpoint(
+				utxo.OutPoint,
+			)
+			if !allowed {
+				log.Warnf("Cannot use unconfirmed "+
+					"utxo=%v because it is "+
+					"unstable and could be "+
+					"replaced", utxo.OutPoint)
+			}
+
+			return allowed
 		}
 
 		// We made sure the input from the user is as sane as possible.
@@ -1420,6 +1625,7 @@ func (w *WalletKit) fundPsbtInternalWallet(account string,
 		// generating a new change address.
 		changeIndex, err := w.cfg.Wallet.FundPsbt(
 			packet, minConfs, feeSatPerKW, account, keyScope,
+			strategy, restrictUnstableUtxos,
 		)
 		if err != nil {
 			return fmt.Errorf("wallet couldn't fund PSBT: %w", err)
@@ -1457,7 +1663,8 @@ func (w *WalletKit) fundPsbtInternalWallet(account string,
 func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 	packet *psbt.Packet, minConfs int32,
 	changeType chanfunding.ChangeAddressType,
-	feeRate chainfee.SatPerKWeight) (*FundPsbtResponse, error) {
+	feeRate chainfee.SatPerKWeight, strategy base.CoinSelectionStrategy) (
+	*FundPsbtResponse, error) {
 
 	// We want to make sure we don't select any inputs that are already
 	// specified in the template. To do that, we require those inputs to
@@ -1528,7 +1735,7 @@ func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 	// Do we already have enough inputs specified to pay for the TX as it
 	// is? In that case we only need to allocate any change, if there is
 	// any.
-	packetFeeNoChange := feeRate.FeeForWeight(int64(estimator.Weight()))
+	packetFeeNoChange := feeRate.FeeForWeight(estimator.Weight())
 	if inputSum >= outputSum+packetFeeNoChange {
 		// Calculate the packet's fee with a change output so, so we can
 		// let the coin selection algorithm decide whether to use a
@@ -1540,9 +1747,7 @@ func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 		case chanfunding.P2WKHChangeAddress:
 			estimator.AddP2WKHOutput()
 		}
-		packetFeeWithChange := feeRate.FeeForWeight(
-			int64(estimator.Weight()),
-		)
+		packetFeeWithChange := feeRate.FeeForWeight(estimator.Weight())
 
 		changeAmt, needMore, err := chanfunding.CalculateChangeAmount(
 			inputSum, outputSum, packetFeeNoChange,
@@ -1603,7 +1808,7 @@ func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 
 		selectedCoins, changeAmount, err := chanfunding.CoinSelect(
 			feeRate, fundingAmount, changeDustLimit, coins,
-			w.cfg.CoinSelectionStrategy, estimator, changeType,
+			strategy, estimator, changeType,
 		)
 		if err != nil {
 			return fmt.Errorf("error selecting coins: %w", err)
@@ -2592,7 +2797,7 @@ func (w *WalletKit) ImportTapscript(_ context.Context,
 	taprootScope := waddrmgr.KeyScopeBIP0086
 	addr, err := w.cfg.Wallet.ImportTaprootScript(taprootScope, tapscript)
 	if err != nil {
-		return nil, fmt.Errorf("error importing script into wallet: %v",
+		return nil, fmt.Errorf("error importing script into wallet: %w",
 			err)
 	}
 

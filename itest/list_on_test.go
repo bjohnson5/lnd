@@ -118,6 +118,14 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testBatchChanFunding,
 	},
 	{
+		Name:     "open channel with unstable utxos",
+		TestFunc: testChannelFundingWithUnstableUtxos,
+	},
+	{
+		Name:     "open psbt channel with unstable utxos",
+		TestFunc: testPsbtChanFundingWithUnstableUtxos,
+	},
+	{
 		Name:     "update channel policy",
 		TestFunc: testUpdateChannelPolicy,
 	},
@@ -204,10 +212,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "channel unsettled balance",
 		TestFunc: testChannelUnsettledBalance,
-	},
-	{
-		Name:     "commitment deadline",
-		TestFunc: testCommitmentTransactionDeadline,
 	},
 	{
 		Name:     "channel force closure",
@@ -463,8 +467,8 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testSignVerifyMessage,
 	},
 	{
-		Name:     "cpfp",
-		TestFunc: testCPFP,
+		Name:     "bumpfee",
+		TestFunc: testBumpFee,
 	},
 	{
 		Name:     "taproot",
@@ -559,6 +563,30 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testQueryBlindedRoutes,
 	},
 	{
+		Name:     "forward blinded",
+		TestFunc: testForwardBlindedRoute,
+	},
+	{
+		Name:     "receiver blinded error",
+		TestFunc: testReceiverBlindedError,
+	},
+	{
+		Name:     "relayer blinded error",
+		TestFunc: testRelayingBlindedError,
+	},
+	{
+		Name:     "introduction blinded error",
+		TestFunc: testIntroductionNodeError,
+	},
+	{
+		Name:     "disable introduction node",
+		TestFunc: testDisableIntroductionNode,
+	},
+	{
+		Name:     "on chain to blinded",
+		TestFunc: testErrorHandlingOnChainFailure,
+	},
+	{
 		Name:     "removetx",
 		TestFunc: testRemoveTx,
 	},
@@ -581,5 +609,21 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "nativesql no migration",
 		TestFunc: testNativeSQLNoMigration,
+	},
+	{
+		Name:     "sweep cpfp anchor outgoing timeout",
+		TestFunc: testSweepCPFPAnchorOutgoingTimeout,
+	},
+	{
+		Name:     "sweep cpfp anchor incoming timeout",
+		TestFunc: testSweepCPFPAnchorIncomingTimeout,
+	},
+	{
+		Name:     "sweep htlcs",
+		TestFunc: testSweepHTLCs,
+	},
+	{
+		Name:     "sweep commit output and anchor",
+		TestFunc: testSweepCommitOutputAndAnchor,
 	},
 }

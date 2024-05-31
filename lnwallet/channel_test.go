@@ -25,6 +25,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -831,7 +832,7 @@ func TestForceClose(t *testing.T) {
 
 type forceCloseTestCase struct {
 	chanType             channeldb.ChannelType
-	expectedCommitWeight int64
+	expectedCommitWeight lntypes.WeightUnit
 	anchorAmt            btcutil.Amount
 }
 
@@ -3037,7 +3038,6 @@ func TestChanSyncOweCommitment(t *testing.T) {
 			Amount:      htlcAmt,
 			Expiry:      uint32(10),
 			OnionBlob:   fakeOnionBlob,
-			ExtraData:   make([]byte, 0),
 		}
 
 		htlcIndex, err := bobChannel.AddHTLC(h, nil)
@@ -3082,7 +3082,6 @@ func TestChanSyncOweCommitment(t *testing.T) {
 		Amount:      htlcAmt,
 		Expiry:      uint32(10),
 		OnionBlob:   fakeOnionBlob,
-		ExtraData:   make([]byte, 0),
 	}
 	aliceHtlcIndex, err := aliceChannel.AddHTLC(aliceHtlc, nil)
 	require.NoError(t, err, "unable to add alice's htlc")
@@ -4804,7 +4803,7 @@ func TestChanAvailableBandwidth(t *testing.T) {
 	)
 
 	assertBandwidthEstimateCorrect := func(aliceInitiate bool,
-		numNonDustHtlcsOnCommit int64) {
+		numNonDustHtlcsOnCommit lntypes.WeightUnit) {
 
 		// With the HTLC's added, we'll now query the AvailableBalance
 		// method for the current available channel bandwidth from
@@ -5190,7 +5189,7 @@ func TestChanCommitWeightDustHtlcs(t *testing.T) {
 	// fromt the given channel's POV.
 	// When sending htlcs we enforce the feebuffer on the commitment
 	// transaction.
-	remoteCommitWeight := func(lc *LightningChannel) int64 {
+	remoteCommitWeight := func(lc *LightningChannel) lntypes.WeightUnit {
 		remoteACKedIndex := lc.localCommitChain.tip().theirMessageIndex
 		htlcView := lc.fetchHTLCView(remoteACKedIndex,
 			lc.localUpdateLog.logIndex)
@@ -10421,8 +10420,9 @@ func createRandomHTLC(t *testing.T, incoming bool) channeldb.HTLC {
 	_, err = rand.Read(sig)
 	require.NoError(t, err)
 
-	extra := make([]byte, 1000)
-	_, err = rand.Read(extra)
+	blinding, err := pubkeyFromHex(
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+	)
 	require.NoError(t, err)
 
 	return channeldb.HTLC{
@@ -10435,7 +10435,10 @@ func createRandomHTLC(t *testing.T, incoming bool) channeldb.HTLC {
 		OnionBlob:     onionBlob,
 		HtlcIndex:     rand.Uint64(),
 		LogIndex:      rand.Uint64(),
-		ExtraData:     extra,
+		BlindingPoint: tlv.SomeRecordT(
+			//nolint:lll
+			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](blinding),
+		),
 	}
 }
 
@@ -10451,8 +10454,8 @@ func TestApplyCommitmentFee(t *testing.T) {
 		balanceBelowReserve = lnwire.NewMSatFromSatoshis(5_000)
 
 		// commitment weight with an additional htlc.
-		commitWeight int64 = input.BaseAnchorCommitmentTxWeight +
-			input.HTLCWeight
+		commitWeight lntypes.WeightUnit = input.
+				BaseAnchorCommitmentTxWeight + input.HTLCWeight
 
 		// fee rate of 10 sat/vbyte.
 		feePerKw  = chainfee.SatPerKWeight(2500)
@@ -11001,4 +11004,64 @@ func TestEnforceFeeBuffer(t *testing.T) {
 	expectedAmt := aliceChannel.channelState.LocalCommitment.LocalBalance
 
 	require.Equal(t, aliceBalance, expectedAmt)
+}
+
+// TestBlindingPointPersistence tests persistence of blinding points attached
+// to htlcs across restarts.
+func TestBlindingPointPersistence(t *testing.T) {
+	// Create a test channel which will be used for the duration of this
+	// test. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	// Send a HTLC from Alice to Bob that has a blinding point populated.
+	htlc, _ := createHTLC(0, 100_000_000)
+	blinding, err := pubkeyFromHex(
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+	)
+	require.NoError(t, err)
+	htlc.BlindingPoint = tlv.SomeRecordT(
+		tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](blinding),
+	)
+
+	_, err = aliceChannel.AddHTLC(htlc, nil)
+
+	require.NoError(t, err)
+	_, err = bobChannel.ReceiveHTLC(htlc)
+	require.NoError(t, err)
+
+	// Now, Alice will send a new commitment to Bob, which will persist our
+	// pending HTLC to disk.
+	aliceCommit, err := aliceChannel.SignNextCommitment()
+	require.NoError(t, err, "unable to sign commitment")
+
+	// Restart alice to force fetching state from disk.
+	aliceChannel, err = restartChannel(aliceChannel)
+	require.NoError(t, err, "unable to restart alice")
+
+	// Assert that the blinding point is restored from disk.
+	remoteCommit := aliceChannel.remoteCommitChain.tip()
+	require.Len(t, remoteCommit.outgoingHTLCs, 1)
+	require.Equal(t, blinding,
+		remoteCommit.outgoingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
+
+	// Next, update bob's commitment and assert that we can still retrieve
+	// his incoming blinding point after restart.
+	err = bobChannel.ReceiveNewCommitment(aliceCommit.CommitSigs)
+	require.NoError(t, err, "bob unable to receive new commitment")
+
+	_, _, _, err = bobChannel.RevokeCurrentCommitment()
+	require.NoError(t, err, "bob unable to revoke current commitment")
+
+	bobChannel, err = restartChannel(bobChannel)
+	require.NoError(t, err, "unable to restart bob's channel")
+
+	// Assert that Bob is able to recover the blinding point from disk.
+	bobCommit := bobChannel.localCommitChain.tip()
+	require.Len(t, bobCommit.incomingHTLCs, 1)
+	require.Equal(t, blinding,
+		bobCommit.incomingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
 }
