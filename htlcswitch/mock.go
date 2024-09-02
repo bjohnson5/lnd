@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -200,7 +201,7 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		HtlcNotifier:           &mockHTLCNotifier{},
 		Clock:                  clock.NewDefaultClock(),
 		MailboxDeliveryTimeout: time.Hour,
-		DustThreshold:          DefaultDustThreshold,
+		MaxFeeExposure:         DefaultMaxFeeExposure,
 		SignAliasUpdate:        signAliasUpdate,
 		IsAlias:                isAlias,
 	}
@@ -683,6 +684,8 @@ func (s *mockServer) RemoteFeatures() *lnwire.FeatureVector {
 	return nil
 }
 
+func (s *mockServer) Disconnect(err error) {}
+
 func (s *mockServer) Stop() error {
 	if !atomic.CompareAndSwapInt32(&s.shutdown, 0, 1) {
 		return nil
@@ -813,7 +816,9 @@ func (f *mockChannelLink) handleSwitchPacket(pkt *htlcPacket) error {
 	return nil
 }
 
-func (f *mockChannelLink) getDustSum(remote bool) lnwire.MilliSatoshi {
+func (f *mockChannelLink) getDustSum(whoseCommit lntypes.ChannelParty,
+	dryRunFee fn.Option[chainfee.SatPerKWeight]) lnwire.MilliSatoshi {
+
 	return 0
 }
 
@@ -826,6 +831,10 @@ func (f *mockChannelLink) getDustClosure() dustClosure {
 	return dustHelper(
 		channeldb.SingleFunderTweaklessBit, dustLimit, dustLimit,
 	)
+}
+
+func (f *mockChannelLink) getCommitFee(remote bool) btcutil.Amount {
+	return 0
 }
 
 func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
@@ -1143,22 +1152,27 @@ type mockHTLCNotifier struct {
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
 	eventType HtlcEventType, linkErr *LinkError,
-	incoming bool) { //nolint:whitespace
+	incoming bool) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
-	eventType HtlcEventType) { //nolint:whitespace
+	eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey,
-	preimage lntypes.Preimage, eventType HtlcEventType) { //nolint:whitespace,lll
+	preimage lntypes.Preimage, eventType HtlcEventType) {
+
 }
 
 func (h *mockHTLCNotifier) NotifyFinalHtlcEvent(key models.CircuitKey,
-	info channeldb.FinalHtlcInfo) { //nolint:whitespace
+	info channeldb.FinalHtlcInfo) {
+
 }

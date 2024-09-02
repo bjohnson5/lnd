@@ -17,9 +17,9 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -33,6 +33,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -42,6 +43,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/rpcwallet"
 	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/rpcperms"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/sqldb"
@@ -103,7 +105,7 @@ type DatabaseBuilder interface {
 type WalletConfigBuilder interface {
 	// BuildWalletConfig is responsible for creating or unlocking and then
 	// fully initializing a wallet.
-	BuildWalletConfig(context.Context, *DatabaseInstances,
+	BuildWalletConfig(context.Context, *DatabaseInstances, *AuxComponents,
 		*rpcperms.InterceptorChain,
 		[]*ListenerWithSignal, string) (*chainreg.PartialChainControl,
 		*btcwallet.Config, func(), error)
@@ -144,6 +146,22 @@ type ImplementationCfg struct {
 	// ChainControlBuilder is a type that can provide a custom wallet
 	// implementation.
 	ChainControlBuilder
+
+	// AuxComponents is a set of auxiliary components that can be used by
+	// lnd for certain custom channel types.
+	AuxComponents
+}
+
+// AuxComponents is a set of auxiliary components that can be used by lnd for
+// certain custom channel types.
+type AuxComponents struct {
+	// AuxLeafStore is an optional data source that can be used by custom
+	// channels to fetch+store various data.
+	AuxLeafStore fn.Option[lnwallet.AuxLeafStore]
+
+	// MsgRouter is an optional message router that if set will be used in
+	// place of a new blank default message router.
+	MsgRouter fn.Option[msgmux.Router]
 }
 
 // DefaultWalletImpl is the default implementation of our normal, btcwallet
@@ -228,7 +246,8 @@ func (d *DefaultWalletImpl) Permissions() map[string][]bakery.Op {
 //
 // NOTE: This is part of the WalletConfigBuilder interface.
 func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
-	dbs *DatabaseInstances, interceptorChain *rpcperms.InterceptorChain,
+	dbs *DatabaseInstances, aux *AuxComponents,
+	interceptorChain *rpcperms.InterceptorChain,
 	grpcListeners []*ListenerWithSignal, passwordKey string) (*chainreg.PartialChainControl,
 	*btcwallet.Config, func(), error) {
 
@@ -284,7 +303,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		//privateWalletPw = lnwallet.DefaultPrivatePassphrase
 		//publicWalletPw  = lnwallet.DefaultPublicPassphrase
 		privateWalletPw = []byte(passwordKey)
-		publicWalletPw = []byte(passwordKey)
+		publicWalletPw  = []byte(passwordKey)
 	)
 
 	// If the user didn't request a seed, then we'll manually assume a
@@ -550,6 +569,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		HeightHintDB:                dbs.HeightHintDB,
 		ChanStateDB:                 dbs.ChanStateDB.ChannelStateDB(),
 		NeutrinoCS:                  neutrinoCS,
+		AuxLeafStore:                aux.AuxLeafStore,
 		ActiveNetParams:             d.cfg.ActiveNetParams,
 		FeeURL:                      d.cfg.FeeURL,
 		Fee: &lncfg.Fee{
@@ -613,8 +633,9 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 
 // proxyBlockEpoch proxies a block epoch subsections to the underlying neutrino
 // rebroadcaster client.
-func proxyBlockEpoch(notifier chainntnfs.ChainNotifier,
-) func() (*blockntfns.Subscription, error) {
+func proxyBlockEpoch(
+	notifier chainntnfs.ChainNotifier) func() (*blockntfns.Subscription,
+	error) {
 
 	return func() (*blockntfns.Subscription, error) {
 		blockEpoch, err := notifier.RegisterBlockEpochNtfn(
@@ -705,14 +726,15 @@ func (d *DefaultWalletImpl) BuildChainControl(
 		ChainIO:               walletController,
 		NetParams:             *walletConfig.NetParams,
 		CoinSelectionStrategy: walletConfig.CoinSelectionStrategy,
+		AuxLeafStore:          partialChainControl.Cfg.AuxLeafStore,
 	}
 
 	// The broadcast is already always active for neutrino nodes, so we
 	// don't want to create a rebroadcast loop.
 	if partialChainControl.Cfg.NeutrinoCS == nil {
+		cs := partialChainControl.ChainSource
 		broadcastCfg := pushtx.Config{
 			Broadcast: func(tx *wire.MsgTx) error {
-				cs := partialChainControl.ChainSource
 				_, err := cs.SendRawTransaction(
 					tx, true,
 				)
@@ -726,7 +748,10 @@ func (d *DefaultWalletImpl) BuildChainControl(
 			// In case the backend is different from neutrino we
 			// make sure that broadcast backend errors are mapped
 			// to the neutrino broadcastErr.
-			MapCustomBroadcastError: broadcastErrorMapper,
+			MapCustomBroadcastError: func(err error) error {
+				rpcErr := cs.MapRPCErr(err)
+				return broadcastErrorMapper(rpcErr)
+			},
 		}
 
 		lnWalletConfig.Rebroadcaster = newWalletReBroadcaster(
@@ -884,6 +909,10 @@ type DatabaseInstances struct {
 	// for native SQL queries for tables that already support it. This may
 	// be nil if the use-native-sql flag was not set.
 	NativeSQLStore *sqldb.BaseDB
+
+	// AuxLeafStore is an optional data source that can be used by custom
+	// channels to fetch+store various data.
+	AuxLeafStore fn.Option[lnwallet.AuxLeafStore]
 }
 
 // DefaultDatabaseBuilder is a type that builds the default database backends
@@ -1477,27 +1506,27 @@ func parseHeaderStateAssertion(state string) (*headerfs.FilterHeader, error) {
 // the neutrino BroadcastError which allows the Rebroadcaster which currently
 // resides in the neutrino package to use all of its functionalities.
 func broadcastErrorMapper(err error) error {
-	returnErr := rpcclient.MapRPCErr(err)
+	var returnErr error
 
 	// We only filter for specific backend errors which are relevant for the
 	// Rebroadcaster.
 	switch {
 	// This makes sure the tx is removed from the rebroadcaster once it is
 	// confirmed.
-	case errors.Is(returnErr, rpcclient.ErrTxAlreadyKnown),
-		errors.Is(err, rpcclient.ErrTxAlreadyConfirmed):
+	case errors.Is(err, chain.ErrTxAlreadyKnown),
+		errors.Is(err, chain.ErrTxAlreadyConfirmed):
 
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Confirmed,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 
 	// Transactions which are still in mempool but might fall out because
 	// of low fees are rebroadcasted despite of their backend error.
-	case errors.Is(returnErr, rpcclient.ErrTxAlreadyInMempool):
+	case errors.Is(err, chain.ErrTxAlreadyInMempool):
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Mempool,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 
 	// Transactions which are not accepted into mempool because of low fees
@@ -1505,13 +1534,12 @@ func broadcastErrorMapper(err error) error {
 	// Mempool conditions change over time so it makes sense to retry
 	// publishing the transaction. Moreover we log the detailed error so the
 	// user can intervene and increase the size of his mempool.
-	case errors.Is(err, rpcclient.ErrMempoolMinFeeNotMet):
-		ltndLog.Warnf("Error while broadcasting transaction: %v",
-			returnErr)
+	case errors.Is(err, chain.ErrMempoolMinFeeNotMet):
+		ltndLog.Warnf("Error while broadcasting transaction: %v", err)
 
 		returnErr = &pushtx.BroadcastError{
 			Code:   pushtx.Mempool,
-			Reason: returnErr.Error(),
+			Reason: err.Error(),
 		}
 	}
 

@@ -19,6 +19,10 @@
 
 # Bug Fixes
 
+* [Fixed a bug](https://github.com/lightningnetwork/lnd/pull/8862) in error
+  matching from publishing transactions that can cause the broadcast process to
+  fail if `btcd` with an older version (pre-`v0.24.2`) is used.
+
 # New Features
 ## Functional Enhancements
 ## RPC Additions
@@ -34,9 +38,12 @@
 
 # Technical and Architectural Updates
 ## BOLT Spec Updates
+
 ## Testing
 ## Database
 ## Code Health
 ## Tooling and Documentation
 
 # Contributors (Alphabetical Order)
+
+* Yyforyongyu

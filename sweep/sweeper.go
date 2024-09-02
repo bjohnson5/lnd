@@ -13,6 +13,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -644,6 +645,12 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 
 			// If this input is forced, we perform an sweep
 			// immediately.
+			//
+			// TODO(ziggie): Make sure when `immediate` is selected
+			// as a parameter that we only trigger the sweeping of
+			// this specific input rather than triggering the sweeps
+			// of all current pending inputs registered with the
+			// sweeper.
 			if input.params.Immediate {
 				inputs := s.updateSweeperInputs()
 				s.sweepPendingInputs(inputs)
@@ -1376,10 +1383,7 @@ func (s *UtxoSweeper) handleInputSpent(spend *chainntnfs.SpendDetail) {
 
 		log.Debugf("Detected third party spend related to in flight "+
 			"inputs (is_ours=%v): %v", isOurTx,
-			newLogClosure(func() string {
-				return spew.Sdump(spend.SpendingTx)
-			}),
-		)
+			lnutils.SpewLogClosure(spend.SpendingTx))
 	}
 
 	// We now use the spending tx to update the state of the inputs.

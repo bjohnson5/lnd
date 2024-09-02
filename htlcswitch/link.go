@@ -4,6 +4,7 @@ import (
 	"bytes"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	prand "math/rand"
 	"sync"
@@ -13,8 +14,6 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
-	"github.com/davecgh/go-spew/spew"
-	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
@@ -22,9 +21,11 @@ import (
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -278,6 +279,10 @@ type ChannelLinkConfig struct {
 	// by failing back any blinding-related payloads as if they were
 	// invalid.
 	DisallowRouteBlinding bool
+
+	// MaxFeeExposure is the threshold in milli-satoshis after which we'll
+	// restrict the flow of HTLCs and fee updates.
+	MaxFeeExposure lnwire.MilliSatoshi
 }
 
 // channelLink is the service which drives a channel's commitment update
@@ -447,6 +452,11 @@ func NewChannelLink(cfg ChannelLinkConfig,
 
 	logPrefix := fmt.Sprintf("ChannelLink(%v):", channel.ChannelPoint())
 
+	// If the max fee exposure isn't set, use the default.
+	if cfg.MaxFeeExposure == 0 {
+		cfg.MaxFeeExposure = DefaultMaxFeeExposure
+	}
+
 	return &channelLink{
 		cfg:                 cfg,
 		channel:             channel,
@@ -470,7 +480,7 @@ var _ ChannelLink = (*channelLink)(nil)
 // NOTE: Part of the ChannelLink interface.
 func (l *channelLink) Start() error {
 	if !atomic.CompareAndSwapInt32(&l.started, 0, 1) {
-		err := errors.Errorf("channel link(%v): already started", l)
+		err := fmt.Errorf("channel link(%v): already started", l)
 		l.log.Warn("already started")
 		return err
 	}
@@ -562,14 +572,18 @@ func (l *channelLink) Stop() {
 	}
 
 	// Ensure the channel for the timer is drained.
-	if !l.updateFeeTimer.Stop() {
-		select {
-		case <-l.updateFeeTimer.C:
-		default:
+	if l.updateFeeTimer != nil {
+		if !l.updateFeeTimer.Stop() {
+			select {
+			case <-l.updateFeeTimer.C:
+			default:
+			}
 		}
 	}
 
-	l.hodlQueue.Stop()
+	if l.hodlQueue != nil {
+		l.hodlQueue.Stop()
+	}
 
 	close(l.quit)
 	l.wg.Wait()
@@ -944,7 +958,7 @@ func (l *channelLink) resolveFwdPkgs() error {
 
 	// If any of our reprocessing steps require an update to the commitment
 	// txn, we initiate a state transition to capture all relevant changes.
-	if l.channel.PendingLocalUpdateCount() > 0 {
+	if l.channel.NumPendingUpdates(lntypes.Local, lntypes.Remote) > 0 {
 		return l.updateCommitTx()
 	}
 
@@ -1072,6 +1086,83 @@ func (l *channelLink) loadAndRemove() error {
 	return l.channel.RemoveFwdPkgs(removeHeights...)
 }
 
+// handleChanSyncErr performs the error handling logic in the case where we
+// could not successfully syncChanStates with our channel peer.
+func (l *channelLink) handleChanSyncErr(err error) {
+	l.log.Warnf("error when syncing channel states: %v", err)
+
+	var errDataLoss *lnwallet.ErrCommitSyncLocalDataLoss
+
+	switch {
+	case errors.Is(err, ErrLinkShuttingDown):
+		l.log.Debugf("unable to sync channel states, link is " +
+			"shutting down")
+		return
+
+	// We failed syncing the commit chains, probably because the remote has
+	// lost state. We should force close the channel.
+	case errors.Is(err, lnwallet.ErrCommitSyncRemoteDataLoss):
+		fallthrough
+
+	// The remote sent us an invalid last commit secret, we should force
+	// close the channel.
+	// TODO(halseth): and permanently ban the peer?
+	case errors.Is(err, lnwallet.ErrInvalidLastCommitSecret):
+		fallthrough
+
+	// The remote sent us a commit point different from what they sent us
+	// before.
+	// TODO(halseth): ban peer?
+	case errors.Is(err, lnwallet.ErrInvalidLocalUnrevokedCommitPoint):
+		// We'll fail the link and tell the peer to force close the
+		// channel. Note that the database state is not updated here,
+		// but will be updated when the close transaction is ready to
+		// avoid that we go down before storing the transaction in the
+		// db.
+		l.failf(
+			LinkFailureError{
+				code:          ErrSyncError,
+				FailureAction: LinkFailureForceClose,
+			},
+			"unable to synchronize channel states: %v", err,
+		)
+
+	// We have lost state and cannot safely force close the channel. Fail
+	// the channel and wait for the remote to hopefully force close it. The
+	// remote has sent us its latest unrevoked commitment point, and we'll
+	// store it in the database, such that we can attempt to recover the
+	// funds if the remote force closes the channel.
+	case errors.As(err, &errDataLoss):
+		err := l.channel.MarkDataLoss(
+			errDataLoss.CommitPoint,
+		)
+		if err != nil {
+			l.log.Errorf("unable to mark channel data loss: %v",
+				err)
+		}
+
+	// We determined the commit chains were not possible to sync. We
+	// cautiously fail the channel, but don't force close.
+	// TODO(halseth): can we safely force close in any cases where this
+	// error is returned?
+	case errors.Is(err, lnwallet.ErrCannotSyncCommitChains):
+		if err := l.channel.MarkBorked(); err != nil {
+			l.log.Errorf("unable to mark channel borked: %v", err)
+		}
+
+	// Other, unspecified error.
+	default:
+	}
+
+	l.failf(
+		LinkFailureError{
+			code:          ErrRecoveryError,
+			FailureAction: LinkFailureForceNone,
+		},
+		"unable to synchronize channel states: %v", err,
+	)
+}
+
 // htlcManager is the primary goroutine which drives a channel's commitment
 // update state-machine in response to messages received via several channels.
 // This goroutine reads messages from the upstream (remote) peer, and also from
@@ -1107,88 +1198,7 @@ func (l *channelLink) htlcManager() {
 	if l.cfg.SyncStates {
 		err := l.syncChanStates()
 		if err != nil {
-			l.log.Warnf("error when syncing channel states: %v", err)
-
-			errDataLoss, localDataLoss :=
-				err.(*lnwallet.ErrCommitSyncLocalDataLoss)
-
-			switch {
-			case err == ErrLinkShuttingDown:
-				l.log.Debugf("unable to sync channel states, " +
-					"link is shutting down")
-				return
-
-			// We failed syncing the commit chains, probably
-			// because the remote has lost state. We should force
-			// close the channel.
-			case err == lnwallet.ErrCommitSyncRemoteDataLoss:
-				fallthrough
-
-			// The remote sent us an invalid last commit secret, we
-			// should force close the channel.
-			// TODO(halseth): and permanently ban the peer?
-			case err == lnwallet.ErrInvalidLastCommitSecret:
-				fallthrough
-
-			// The remote sent us a commit point different from
-			// what they sent us before.
-			// TODO(halseth): ban peer?
-			case err == lnwallet.ErrInvalidLocalUnrevokedCommitPoint:
-				// We'll fail the link and tell the peer to
-				// force close the channel. Note that the
-				// database state is not updated here, but will
-				// be updated when the close transaction is
-				// ready to avoid that we go down before
-				// storing the transaction in the db.
-				l.fail(
-					LinkFailureError{
-						code:          ErrSyncError,
-						FailureAction: LinkFailureForceClose, //nolint:lll
-					},
-					"unable to synchronize channel "+
-						"states: %v", err,
-				)
-				return
-
-			// We have lost state and cannot safely force close the
-			// channel. Fail the channel and wait for the remote to
-			// hopefully force close it. The remote has sent us its
-			// latest unrevoked commitment point, and we'll store
-			// it in the database, such that we can attempt to
-			// recover the funds if the remote force closes the
-			// channel.
-			case localDataLoss:
-				err := l.channel.MarkDataLoss(
-					errDataLoss.CommitPoint,
-				)
-				if err != nil {
-					l.log.Errorf("unable to mark channel "+
-						"data loss: %v", err)
-				}
-
-			// We determined the commit chains were not possible to
-			// sync. We cautiously fail the channel, but don't
-			// force close.
-			// TODO(halseth): can we safely force close in any
-			// cases where this error is returned?
-			case err == lnwallet.ErrCannotSyncCommitChains:
-				if err := l.channel.MarkBorked(); err != nil {
-					l.log.Errorf("unable to mark channel "+
-						"borked: %v", err)
-				}
-
-			// Other, unspecified error.
-			default:
-			}
-
-			l.fail(
-				LinkFailureError{
-					code:          ErrRecoveryError,
-					FailureAction: LinkFailureForceNone,
-				},
-				"unable to synchronize channel "+
-					"states: %v", err,
-			)
+			l.handleChanSyncErr(err)
 			return
 		}
 	}
@@ -1245,14 +1255,14 @@ func (l *channelLink) htlcManager() {
 		// If the duplicate keystone error was encountered, we'll fail
 		// without sending an Error message to the peer.
 		case ErrDuplicateKeystone:
-			l.fail(LinkFailureError{code: ErrCircuitError},
+			l.failf(LinkFailureError{code: ErrCircuitError},
 				"temporary circuit error: %v", err)
 			return
 
 		// A non-nil error was encountered, send an Error message to
 		// the peer.
 		default:
-			l.fail(LinkFailureError{code: ErrInternalError},
+			l.failf(LinkFailureError{code: ErrInternalError},
 				"unable to resolve fwd pkgs: %v", err)
 			return
 		}
@@ -1276,15 +1286,19 @@ func (l *channelLink) htlcManager() {
 		// the batch ticker so that it can be cleared. Otherwise pause
 		// the ticker to prevent waking up the htlcManager while the
 		// batch is empty.
-		if l.channel.PendingLocalUpdateCount() > 0 {
+		numUpdates := l.channel.NumPendingUpdates(
+			lntypes.Local, lntypes.Remote,
+		)
+		if numUpdates > 0 {
 			l.cfg.BatchTicker.Resume()
 			l.log.Tracef("BatchTicker resumed, "+
-				"PendingLocalUpdateCount=%d",
-				l.channel.PendingLocalUpdateCount())
+				"NumPendingUpdates(Local, Remote)=%d",
+				numUpdates,
+			)
 		} else {
 			l.cfg.BatchTicker.Pause()
 			l.log.Trace("BatchTicker paused due to zero " +
-				"PendingLocalUpdateCount")
+				"NumPendingUpdates(Local, Remote)")
 		}
 
 		select {
@@ -1391,7 +1405,7 @@ func (l *channelLink) htlcManager() {
 			}
 
 		case <-l.cfg.PendingCommitTicker.Ticks():
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:          ErrRemoteUnresponsive,
 					FailureAction: LinkFailureDisconnect,
@@ -1424,19 +1438,19 @@ func (l *channelLink) htlcManager() {
 			// If the duplicate keystone error was encountered,
 			// fail back gracefully.
 			case ErrDuplicateKeystone:
-				l.fail(LinkFailureError{code: ErrCircuitError},
-					fmt.Sprintf("process hodl queue: "+
-						"temporary circuit error: %v",
-						err,
-					),
+				l.failf(LinkFailureError{
+					code: ErrCircuitError,
+				}, "process hodl queue: "+
+					"temporary circuit error: %v",
+					err,
 				)
 
 			// Send an Error message to the peer.
 			default:
-				l.fail(LinkFailureError{code: ErrInternalError},
-					fmt.Sprintf("process hodl queue: "+
-						"unable to update commitment:"+
-						" %v", err),
+				l.failf(LinkFailureError{
+					code: ErrInternalError,
+				}, "process hodl queue: unable to update "+
+					"commitment: %v", err,
 				)
 			}
 
@@ -1591,6 +1605,20 @@ func (l *channelLink) handleDownstreamUpdateAdd(pkt *htlcPacket) error {
 		return nil
 	}
 
+	// Check if we can add the HTLC here without exceededing the max fee
+	// exposure threshold.
+	if l.isOverexposedWithHtlc(htlc, false) {
+		l.log.Debugf("Unable to handle downstream HTLC - max fee " +
+			"exposure exceeded")
+
+		l.mailBox.FailAdd(pkt)
+
+		return NewDetailedLinkError(
+			lnwire.NewTemporaryChannelFailure(nil),
+			OutgoingFailureDownstreamHtlcAdd,
+		)
+	}
+
 	// A new payment has been initiated via the downstream channel,
 	// so we add the new HTLC to our local log, then update the
 	// commitment chains.
@@ -1628,7 +1656,7 @@ func (l *channelLink) handleDownstreamUpdateAdd(pkt *htlcPacket) error {
 	l.log.Tracef("received downstream htlc: payment_hash=%x, "+
 		"local_log_index=%v, pend_updates=%v",
 		htlc.PaymentHash[:], index,
-		l.channel.PendingLocalUpdateCount())
+		l.channel.NumPendingUpdates(lntypes.Local, lntypes.Remote))
 
 	pkt.outgoingChanID = l.ShortChanID()
 	pkt.outgoingHTLCID = index
@@ -1834,7 +1862,8 @@ func (l *channelLink) handleDownstreamPkt(pkt *htlcPacket) {
 // tryBatchUpdateCommitTx updates the commitment transaction if the batch is
 // full.
 func (l *channelLink) tryBatchUpdateCommitTx() {
-	if l.channel.PendingLocalUpdateCount() < uint64(l.cfg.BatchSize) {
+	pending := l.channel.NumPendingUpdates(lntypes.Local, lntypes.Remote)
+	if pending < uint64(l.cfg.BatchSize) {
 		return
 	}
 
@@ -1910,7 +1939,6 @@ func (l *channelLink) cleanupSpuriousResponse(pkt *htlcPacket) {
 // direct channel with, updating our respective commitment chains.
 func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 	switch msg := msg.(type) {
-
 	case *lnwire.UpdateAddHTLC:
 		if l.IsFlushing(Incoming) {
 			// This is forbidden by the protocol specification.
@@ -1932,7 +1960,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			// handle message ordering due to concurrency choices.
 			// An issue has been filed to address this here:
 			// https://github.com/lightningnetwork/lnd/issues/8393
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:             ErrInvalidUpdate,
 					FailureAction:    LinkFailureDisconnect,
@@ -1951,9 +1979,21 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// where we are a relaying node (as the blinding point will
 		// be in the payload when we're the introduction node).
 		if msg.BlindingPoint.IsSome() && l.cfg.DisallowRouteBlinding {
-			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+			l.failf(LinkFailureError{code: ErrInvalidUpdate},
 				"blinding point included when route blinding "+
 					"is disabled")
+
+			return
+		}
+
+		// We have to check the limit here rather than later in the
+		// switch because the counterparty can keep sending HTLC's
+		// without sending a revoke. This would mean that the switch
+		// check would only occur later.
+		if l.isOverexposedWithHtlc(msg, true) {
+			l.failf(LinkFailureError{code: ErrInternalError},
+				"peer sent us an HTLC that exceeded our max "+
+					"fee exposure")
 
 			return
 		}
@@ -1963,7 +2003,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// "settle" list in the event that we know the preimage.
 		index, err := l.channel.ReceiveHTLC(msg)
 		if err != nil {
-			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+			l.failf(LinkFailureError{code: ErrInvalidUpdate},
 				"unable to handle upstream add HTLC: %v", err)
 			return
 		}
@@ -1989,7 +2029,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		}
 
 		if !lockedin {
-			l.fail(
+			l.failf(
 				LinkFailureError{code: ErrInvalidUpdate},
 				"unable to handle upstream settle",
 			)
@@ -1997,7 +2037,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		}
 
 		if err := l.channel.ReceiveHTLCSettle(pre, idx); err != nil {
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:          ErrInvalidUpdate,
 					FailureAction: LinkFailureForceClose,
@@ -2086,7 +2126,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// message to the usual HTLC fail message.
 		err := l.channel.ReceiveFailHTLC(msg.ID, b.Bytes())
 		if err != nil {
-			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+			l.failf(LinkFailureError{code: ErrInvalidUpdate},
 				"unable to handle upstream fail HTLC: %v", err)
 			return
 		}
@@ -2124,7 +2164,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		idx := msg.ID
 		err := l.channel.ReceiveFailHTLC(idx, msg.Reason[:])
 		if err != nil {
-			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+			l.failf(LinkFailureError{code: ErrInvalidUpdate},
 				"unable to handle upstream fail HTLC: %v", err)
 			return
 		}
@@ -2143,7 +2183,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			l.uncommittedPreimages...,
 		)
 		if err != nil {
-			l.fail(
+			l.failf(
 				LinkFailureError{code: ErrInternalError},
 				"unable to add preimages=%v to cache: %v",
 				l.uncommittedPreimages, err,
@@ -2179,7 +2219,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			case *lnwallet.InvalidHtlcSigError:
 				sendData = []byte(err.Error())
 			}
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:          ErrInvalidCommitment,
 					FailureAction: LinkFailureForceClose,
@@ -2208,7 +2248,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			// NOTE: We do not trigger a force close because this
 			// could resolve itself in case our db was just busy
 			// not accepting new transactions.
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:          ErrInternalError,
 					Warning:       true,
@@ -2296,7 +2336,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 			ReceiveRevocation(msg)
 		if err != nil {
 			// TODO(halseth): force close?
-			l.fail(
+			l.failf(
 				LinkFailureError{
 					code:          ErrInvalidRevocation,
 					FailureAction: LinkFailureDisconnect,
@@ -2336,9 +2376,9 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 				&chanID, state.RemoteCommitment.CommitHeight-1,
 			)
 			if err != nil {
-				l.fail(LinkFailureError{code: ErrInternalError},
-					"unable to queue breach backup: %v",
-					err)
+				l.failf(LinkFailureError{
+					code: ErrInternalError,
+				}, "unable to queue breach backup: %v", err)
 				return
 			}
 		}
@@ -2375,11 +2415,34 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		l.RWMutex.Unlock()
 
 	case *lnwire.UpdateFee:
+		// Check and see if their proposed fee-rate would make us
+		// exceed the fee threshold.
+		fee := chainfee.SatPerKWeight(msg.FeePerKw)
+
+		isDust, err := l.exceedsFeeExposureLimit(fee)
+		if err != nil {
+			// This shouldn't typically happen. If it does, it
+			// indicates something is wrong with our channel state.
+			l.log.Errorf("Unable to determine if fee threshold " +
+				"exceeded")
+			l.failf(LinkFailureError{code: ErrInternalError},
+				"error calculating fee exposure: %v", err)
+
+			return
+		}
+
+		if isDust {
+			// The proposed fee-rate makes us exceed the fee
+			// threshold.
+			l.failf(LinkFailureError{code: ErrInternalError},
+				"fee threshold exceeded: %v", err)
+			return
+		}
+
 		// We received fee update from peer. If we are the initiator we
 		// will fail the channel, if not we will apply the update.
-		fee := chainfee.SatPerKWeight(msg.FeePerKw)
 		if err := l.channel.ReceiveUpdateFee(fee); err != nil {
-			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+			l.failf(LinkFailureError{code: ErrInvalidUpdate},
 				"error receiving fee update: %v", err)
 			return
 		}
@@ -2398,7 +2461,7 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// Error received from remote, MUST fail channel, but should
 		// only print the contents of the error message if all
 		// characters are printable ASCII.
-		l.fail(
+		l.failf(
 			LinkFailureError{
 				code: ErrRemoteError,
 
@@ -2487,14 +2550,14 @@ func (l *channelLink) updateCommitTxOrFail() bool {
 	// A duplicate keystone error should be resolved and is not fatal, so
 	// we won't send an Error message to the peer.
 	case ErrDuplicateKeystone:
-		l.fail(LinkFailureError{code: ErrCircuitError},
+		l.failf(LinkFailureError{code: ErrCircuitError},
 			"temporary circuit error: %v", err)
 		return false
 
 	// Any other error is treated results in an Error message being sent to
 	// the peer.
 	default:
-		l.fail(LinkFailureError{code: ErrInternalError},
+		l.failf(LinkFailureError{code: ErrInternalError},
 			"unable to update commitment: %v", err)
 		return false
 	}
@@ -2533,16 +2596,12 @@ func (l *channelLink) updateCommitTx() error {
 		l.cfg.PendingCommitTicker.Resume()
 		l.log.Trace("PendingCommitTicker resumed")
 
+		n := l.channel.NumPendingUpdates(lntypes.Local, lntypes.Remote)
 		l.log.Tracef("revocation window exhausted, unable to send: "+
-			"%v, pend_updates=%v, dangling_closes%v",
-			l.channel.PendingLocalUpdateCount(),
-			newLogClosure(func() string {
-				return spew.Sdump(l.openedCircuits)
-			}),
-			newLogClosure(func() string {
-				return spew.Sdump(l.closedCircuits)
-			}),
-		)
+			"%v, pend_updates=%v, dangling_closes%v", n,
+			lnutils.SpewLogClosure(l.openedCircuits),
+			lnutils.SpewLogClosure(l.closedCircuits))
+
 		return nil
 	} else if err != nil {
 		return err
@@ -2672,8 +2731,10 @@ func (l *channelLink) MayAddOutgoingHtlc(amt lnwire.MilliSatoshi) error {
 // method.
 //
 // NOTE: Part of the dustHandler interface.
-func (l *channelLink) getDustSum(remote bool) lnwire.MilliSatoshi {
-	return l.channel.GetDustSum(remote)
+func (l *channelLink) getDustSum(whoseCommit lntypes.ChannelParty,
+	dryRunFee fn.Option[chainfee.SatPerKWeight]) lnwire.MilliSatoshi {
+
+	return l.channel.GetDustSum(whoseCommit, dryRunFee)
 }
 
 // getFeeRate is a wrapper method that retrieves the underlying channel's
@@ -2696,30 +2757,159 @@ func (l *channelLink) getDustClosure() dustClosure {
 	return dustHelper(chanType, localDustLimit, remoteDustLimit)
 }
 
+// getCommitFee returns either the local or remote CommitFee in satoshis. This
+// is used so that the Switch can have access to the commitment fee without
+// needing to have a *LightningChannel. This doesn't include dust.
+//
+// NOTE: Part of the dustHandler interface.
+func (l *channelLink) getCommitFee(remote bool) btcutil.Amount {
+	if remote {
+		return l.channel.State().RemoteCommitment.CommitFee
+	}
+
+	return l.channel.State().LocalCommitment.CommitFee
+}
+
+// exceedsFeeExposureLimit returns whether or not the new proposed fee-rate
+// increases the total dust and fees within the channel past the configured
+// fee threshold. It first calculates the dust sum over every update in the
+// update log with the proposed fee-rate and taking into account both the local
+// and remote dust limits. It uses every update in the update log instead of
+// what is actually on the local and remote commitments because it is assumed
+// that in a worst-case scenario, every update in the update log could
+// theoretically be on either commitment transaction and this needs to be
+// accounted for with this fee-rate. It then calculates the local and remote
+// commitment fees given the proposed fee-rate. Finally, it tallies the results
+// and determines if the fee threshold has been exceeded.
+func (l *channelLink) exceedsFeeExposureLimit(
+	feePerKw chainfee.SatPerKWeight) (bool, error) {
+
+	dryRunFee := fn.Some[chainfee.SatPerKWeight](feePerKw)
+
+	// Get the sum of dust for both the local and remote commitments using
+	// this "dry-run" fee.
+	localDustSum := l.getDustSum(lntypes.Local, dryRunFee)
+	remoteDustSum := l.getDustSum(lntypes.Remote, dryRunFee)
+
+	// Calculate the local and remote commitment fees using this dry-run
+	// fee.
+	localFee, remoteFee, err := l.channel.CommitFeeTotalAt(feePerKw)
+	if err != nil {
+		return false, err
+	}
+
+	// Finally, check whether the max fee exposure was exceeded on either
+	// future commitment transaction with the fee-rate.
+	totalLocalDust := localDustSum + lnwire.NewMSatFromSatoshis(localFee)
+	if totalLocalDust > l.cfg.MaxFeeExposure {
+		return true, nil
+	}
+
+	totalRemoteDust := remoteDustSum + lnwire.NewMSatFromSatoshis(
+		remoteFee,
+	)
+
+	return totalRemoteDust > l.cfg.MaxFeeExposure, nil
+}
+
+// isOverexposedWithHtlc calculates whether the proposed HTLC will make the
+// channel exceed the fee threshold. It first fetches the largest fee-rate that
+// may be on any unrevoked commitment transaction. Then, using this fee-rate,
+// determines if the to-be-added HTLC is dust. If the HTLC is dust, it adds to
+// the overall dust sum. If it is not dust, it contributes to weight, which
+// also adds to the overall dust sum by an increase in fees. If the dust sum on
+// either commitment exceeds the configured fee threshold, this function
+// returns true.
+func (l *channelLink) isOverexposedWithHtlc(htlc *lnwire.UpdateAddHTLC,
+	incoming bool) bool {
+
+	dustClosure := l.getDustClosure()
+
+	feeRate := l.channel.WorstCaseFeeRate()
+
+	amount := htlc.Amount.ToSatoshis()
+
+	// See if this HTLC is dust on both the local and remote commitments.
+	isLocalDust := dustClosure(feeRate, incoming, lntypes.Local, amount)
+	isRemoteDust := dustClosure(feeRate, incoming, lntypes.Remote, amount)
+
+	// Calculate the dust sum for the local and remote commitments.
+	localDustSum := l.getDustSum(
+		lntypes.Local, fn.None[chainfee.SatPerKWeight](),
+	)
+	remoteDustSum := l.getDustSum(
+		lntypes.Remote, fn.None[chainfee.SatPerKWeight](),
+	)
+
+	// Grab the larger of the local and remote commitment fees w/o dust.
+	commitFee := l.getCommitFee(false)
+
+	if l.getCommitFee(true) > commitFee {
+		commitFee = l.getCommitFee(true)
+	}
+
+	localDustSum += lnwire.NewMSatFromSatoshis(commitFee)
+	remoteDustSum += lnwire.NewMSatFromSatoshis(commitFee)
+
+	// Calculate the additional fee increase if this is a non-dust HTLC.
+	weight := lntypes.WeightUnit(input.HTLCWeight)
+	additional := lnwire.NewMSatFromSatoshis(
+		feeRate.FeeForWeight(weight),
+	)
+
+	if isLocalDust {
+		// If this is dust, it doesn't contribute to weight but does
+		// contribute to the overall dust sum.
+		localDustSum += lnwire.NewMSatFromSatoshis(amount)
+	} else {
+		// Account for the fee increase that comes with an increase in
+		// weight.
+		localDustSum += additional
+	}
+
+	if localDustSum > l.cfg.MaxFeeExposure {
+		// The max fee exposure was exceeded.
+		return true
+	}
+
+	if isRemoteDust {
+		// If this is dust, it doesn't contribute to weight but does
+		// contribute to the overall dust sum.
+		remoteDustSum += lnwire.NewMSatFromSatoshis(amount)
+	} else {
+		// Account for the fee increase that comes with an increase in
+		// weight.
+		remoteDustSum += additional
+	}
+
+	return remoteDustSum > l.cfg.MaxFeeExposure
+}
+
 // dustClosure is a function that evaluates whether an HTLC is dust. It returns
 // true if the HTLC is dust. It takes in a feerate, a boolean denoting whether
 // the HTLC is incoming (i.e. one that the remote sent), a boolean denoting
 // whether to evaluate on the local or remote commit, and finally an HTLC
 // amount to test.
-type dustClosure func(chainfee.SatPerKWeight, bool, bool, btcutil.Amount) bool
+type dustClosure func(feerate chainfee.SatPerKWeight, incoming bool,
+	whoseCommit lntypes.ChannelParty, amt btcutil.Amount) bool
 
 // dustHelper is used to construct the dustClosure.
 func dustHelper(chantype channeldb.ChannelType, localDustLimit,
 	remoteDustLimit btcutil.Amount) dustClosure {
 
-	isDust := func(feerate chainfee.SatPerKWeight, incoming,
-		localCommit bool, amt btcutil.Amount) bool {
+	isDust := func(feerate chainfee.SatPerKWeight, incoming bool,
+		whoseCommit lntypes.ChannelParty, amt btcutil.Amount) bool {
 
-		if localCommit {
-			return lnwallet.HtlcIsDust(
-				chantype, incoming, true, feerate, amt,
-				localDustLimit,
-			)
+		var dustLimit btcutil.Amount
+		if whoseCommit.IsLocal() {
+			dustLimit = localDustLimit
+		} else {
+			dustLimit = remoteDustLimit
 		}
 
 		return lnwallet.HtlcIsDust(
-			chantype, incoming, false, feerate, amt,
-			remoteDustLimit,
+			chantype, incoming, whoseCommit, feerate, amt,
+			dustLimit,
 		)
 	}
 
@@ -3064,6 +3254,19 @@ func (l *channelLink) updateChannelFee(feePerKw chainfee.SatPerKWeight) error {
 		return nil
 	}
 
+	// Check and see if our proposed fee-rate would make us exceed the fee
+	// threshold.
+	thresholdExceeded, err := l.exceedsFeeExposureLimit(feePerKw)
+	if err != nil {
+		// This shouldn't typically happen. If it does, it indicates
+		// something is wrong with our channel state.
+		return err
+	}
+
+	if thresholdExceeded {
+		return fmt.Errorf("link fee threshold exceeded")
+	}
+
 	// First, we'll update the local fee on our commitment.
 	if err := l.channel.UpdateFee(feePerKw); err != nil {
 		return err
@@ -3094,7 +3297,7 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg,
 		return
 	}
 
-	l.log.Debugf("settle-fail-filter %v", fwdPkg.SettleFailFilter)
+	l.log.Debugf("settle-fail-filter: %v", fwdPkg.SettleFailFilter)
 
 	var switchPackets []*htlcPacket
 	for i, pd := range settleFails {
@@ -3237,7 +3440,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 		fwdPkg.ID(), decodeReqs,
 	)
 	if sphinxErr != nil {
-		l.fail(LinkFailureError{code: ErrInternalError},
+		l.failf(LinkFailureError{code: ErrInternalError},
 			"unable to decode hop iterators: %v", sphinxErr)
 		return
 	}
@@ -3396,9 +3599,9 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 				pd, obfuscator, fwdInfo, heightNow, pld,
 			)
 			if err != nil {
-				l.fail(LinkFailureError{code: ErrInternalError},
-					err.Error(),
-				)
+				l.failf(LinkFailureError{
+					code: ErrInternalError,
+				}, err.Error()) //nolint
 
 				return
 			}
@@ -3542,7 +3745,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg,
 	if fwdPkg.State == channeldb.FwdStateLockedIn {
 		err := l.channel.SetFwdFilter(fwdPkg.Height, fwdPkg.FwdFilter)
 		if err != nil {
-			l.fail(LinkFailureError{code: ErrInternalError},
+			l.failf(LinkFailureError{code: ErrInternalError},
 				"unable to set fwd filter: %v", err)
 			return
 		}
@@ -3778,9 +3981,6 @@ func (l *channelLink) sendHTLCError(pd *lnwallet.PaymentDescriptor,
 // that we're not part of a blinded route and an error encrypter that'll be
 // used if we are the introduction node and need to present an error as if
 // we're the failing party.
-//
-// Note: this function does not yet handle special error cases for receiving
-// nodes in blinded paths, as LND does not support blinded receives.
 func (l *channelLink) sendIncomingHTLCFailureMsg(htlcIndex uint64,
 	e hop.ErrorEncrypter,
 	originalFailure lnwire.OpaqueReason) error {
@@ -3877,14 +4077,15 @@ func (l *channelLink) sendMalformedHTLCError(htlcIndex uint64,
 	})
 }
 
-// fail is a function which is used to encapsulate the action necessary for
+// failf is a function which is used to encapsulate the action necessary for
 // properly failing the link. It takes a LinkFailureError, which will be passed
 // to the OnChannelFailure closure, in order for it to determine if we should
 // force close the channel, and if we should send an error message to the
 // remote peer.
-func (l *channelLink) fail(linkErr LinkFailureError,
-	format string, a ...interface{}) {
-	reason := errors.Errorf(format, a...)
+func (l *channelLink) failf(linkErr LinkFailureError, format string,
+	a ...interface{}) {
+
+	reason := fmt.Errorf(format, a...)
 
 	// Return if we have already notified about a failure.
 	if l.failed {

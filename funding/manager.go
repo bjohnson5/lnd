@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -23,6 +24,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/discovery"
+	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/labels"
@@ -33,7 +36,6 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing"
 	"golang.org/x/crypto/salsa20"
 )
 
@@ -287,7 +289,7 @@ type InitFundingMsg struct {
 	// PendingChanID is not all zeroes (the default value), then this will
 	// be the pending channel ID used for the funding flow within the wire
 	// protocol.
-	PendingChanID [32]byte
+	PendingChanID PendingChanID
 
 	// ChannelType allows the caller to use an explicit channel type for the
 	// funding negotiation. This type will only be observed if BOTH sides
@@ -317,7 +319,7 @@ type fundingMsg struct {
 // pendingChannels is a map instantiated per-peer which tracks all active
 // pending single funded channels indexed by their pending channel identifier,
 // which is a set of 32-bytes generated via a CSPRNG.
-type pendingChannels map[[32]byte]*reservationWithCtx
+type pendingChannels map[PendingChanID]*reservationWithCtx
 
 // serializedPubKey is used within the FundingManager's activeReservations list
 // to identify the nodes with which the FundingManager is actively working to
@@ -543,6 +545,10 @@ type Config struct {
 	// backed funding flow to not use utxos still being swept by the sweeper
 	// subsystem.
 	IsSweeperOutpoint func(wire.OutPoint) bool
+
+	// AuxLeafStore is an optional store that can be used to store auxiliary
+	// leaves for certain custom channel types.
+	AuxLeafStore fn.Option[lnwallet.AuxLeafStore]
 }
 
 // Manager acts as an orchestrator/bridge between the wallet's
@@ -568,8 +574,10 @@ type Manager struct {
 
 	// chanIDNonce is a nonce that's incremented for each new funding
 	// reservation created.
-	nonceMtx    sync.RWMutex
-	chanIDNonce uint64
+	chanIDNonce atomic.Uint64
+
+	// nonceMtx is a mutex that guards the pendingMusigNonces.
+	nonceMtx sync.RWMutex
 
 	// pendingMusigNonces is used to store the musig2 nonce we generate to
 	// send funding locked until we receive a funding locked message from
@@ -591,7 +599,7 @@ type Manager struct {
 	// required as mid funding flow, we switch to referencing the channel
 	// by its full channel ID once the commitment transactions have been
 	// signed by both parties.
-	signedReservations map[lnwire.ChannelID][32]byte
+	signedReservations map[lnwire.ChannelID]PendingChanID
 
 	// resMtx guards both of the maps above to ensure that all access is
 	// goroutine safe.
@@ -629,11 +637,11 @@ const (
 	// but we still haven't announced the channel to the network.
 	channelReadySent
 
-	// addedToRouterGraph is the opening state of a channel if the
-	// channel has been successfully added to the router graph
-	// immediately after the channelReady message has been sent, but
-	// we still haven't announced the channel to the network.
-	addedToRouterGraph
+	// addedToGraph is the opening state of a channel if the channel has
+	// been successfully added to the graph immediately after the
+	// channelReady message has been sent, but we still haven't announced
+	// the channel to the network.
+	addedToGraph
 )
 
 func (c channelOpeningState) String() string {
@@ -642,8 +650,8 @@ func (c channelOpeningState) String() string {
 		return "markedOpen"
 	case channelReadySent:
 		return "channelReadySent"
-	case addedToRouterGraph:
-		return "addedToRouterGraph"
+	case addedToGraph:
+		return "addedToGraph"
 	default:
 		return "unknown"
 	}
@@ -798,24 +806,28 @@ func (f *Manager) rebroadcastFundingTx(c *channeldb.OpenChannel) {
 	}
 }
 
+// PendingChanID is a type that represents a pending channel ID. This might be
+// selected by the caller, but if not, will be automatically selected.
+type PendingChanID = [32]byte
+
 // nextPendingChanID returns the next free pending channel ID to be used to
 // identify a particular future channel funding workflow.
-func (f *Manager) nextPendingChanID() [32]byte {
-	// Obtain a fresh nonce. We do this by encoding the current nonce
-	// counter, then incrementing it by one.
-	f.nonceMtx.Lock()
-	var nonce [8]byte
-	binary.LittleEndian.PutUint64(nonce[:], f.chanIDNonce)
-	f.chanIDNonce++
-	f.nonceMtx.Unlock()
+func (f *Manager) nextPendingChanID() PendingChanID {
+	// Obtain a fresh nonce. We do this by encoding the incremented nonce.
+	nextNonce := f.chanIDNonce.Add(1)
+
+	var nonceBytes [8]byte
+	binary.LittleEndian.PutUint64(nonceBytes[:], nextNonce)
 
 	// We'll generate the next pending channelID by "encrypting" 32-bytes
 	// of zeroes which'll extract 32 random bytes from our stream cipher.
 	var (
-		nextChanID [32]byte
+		nextChanID PendingChanID
 		zeroes     [32]byte
 	)
-	salsa20.XORKeyStream(nextChanID[:], zeroes[:], nonce[:], &f.chanIDKey)
+	salsa20.XORKeyStream(
+		nextChanID[:], zeroes[:], nonceBytes[:], &f.chanIDKey,
+	)
 
 	return nextChanID
 }
@@ -1039,13 +1051,14 @@ func (f *Manager) reservationCoordinator() {
 // advanceFundingState will advance the channel through the steps after the
 // funding transaction is broadcasted, up until the point where the channel is
 // ready for operation. This includes waiting for the funding transaction to
-// confirm, sending channel_ready to the peer, adding the channel to the
-// router graph, and announcing the channel. The updateChan can be set non-nil
-// to get OpenStatusUpdates.
+// confirm, sending channel_ready to the peer, adding the channel to the graph,
+// and announcing the channel. The updateChan can be set non-nil to get
+// OpenStatusUpdates.
 //
 // NOTE: This MUST be run as a goroutine.
 func (f *Manager) advanceFundingState(channel *channeldb.OpenChannel,
-	pendingChanID [32]byte, updateChan chan<- *lnrpc.OpenStatusUpdate) {
+	pendingChanID PendingChanID,
+	updateChan chan<- *lnrpc.OpenStatusUpdate) {
 
 	defer f.wg.Done()
 
@@ -1061,9 +1074,14 @@ func (f *Manager) advanceFundingState(channel *channeldb.OpenChannel,
 		}
 	}
 
+	var chanOpts []lnwallet.ChannelOpt
+	f.cfg.AuxLeafStore.WhenSome(func(s lnwallet.AuxLeafStore) {
+		chanOpts = append(chanOpts, lnwallet.WithLeafStore(s))
+	})
+
 	// We create the state-machine object which wraps the database state.
 	lnChannel, err := lnwallet.NewLightningChannel(
-		nil, channel, nil,
+		nil, channel, nil, chanOpts...,
 	)
 	if err != nil {
 		log.Errorf("Unable to create LightningChannel(%v): %v",
@@ -1115,7 +1133,7 @@ func (f *Manager) advanceFundingState(channel *channeldb.OpenChannel,
 // updateChan can be set non-nil to get OpenStatusUpdates.
 func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 	lnChannel *lnwallet.LightningChannel,
-	shortChanID *lnwire.ShortChannelID, pendingChanID [32]byte,
+	shortChanID *lnwire.ShortChannelID, pendingChanID PendingChanID,
 	channelState channelOpeningState,
 	updateChan chan<- *lnrpc.OpenStatusUpdate) error {
 
@@ -1152,7 +1170,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 		return nil
 
 	// channelReady was sent to peer, but the channel was not added to the
-	// router graph and the channel announcement was not sent.
+	// graph and the channel announcement was not sent.
 	case channelReadySent:
 		// We must wait until we've received the peer's channel_ready
 		// before sending a channel_update according to BOLT#07.
@@ -1183,12 +1201,12 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 
 	// The channel was added to the Router's topology, but the channel
 	// announcement was not sent.
-	case addedToRouterGraph:
+	case addedToGraph:
 		if channel.IsZeroConf() {
 			// If this is a zero-conf channel, then we will wait
 			// for it to be confirmed before announcing it to the
 			// greater network.
-			err := f.waitForZeroConfChannel(channel, pendingChanID)
+			err := f.waitForZeroConfChannel(channel)
 			if err != nil {
 				return fmt.Errorf("failed waiting for zero "+
 					"channel: %v", err)
@@ -1239,7 +1257,7 @@ func (f *Manager) stateStep(channel *channeldb.OpenChannel,
 // advancePendingChannelState waits for a pending channel's funding tx to
 // confirm, and marks it open in the database when that happens.
 func (f *Manager) advancePendingChannelState(
-	channel *channeldb.OpenChannel, pendingChanID [32]byte) error {
+	channel *channeldb.OpenChannel, pendingChanID PendingChanID) error {
 
 	if channel.IsZeroConf() {
 		// Persist the alias to the alias database.
@@ -1671,16 +1689,18 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 
 	// We'll also validate and apply all the constraints the initiating
 	// party is attempting to dictate for our commitment transaction.
-	channelConstraints := &channeldb.ChannelConstraints{
-		DustLimit:        msg.DustLimit,
+	stateBounds := &channeldb.ChannelStateBounds{
 		ChanReserve:      msg.ChannelReserve,
 		MaxPendingAmount: msg.MaxValueInFlight,
 		MinHTLC:          msg.HtlcMinimum,
 		MaxAcceptedHtlcs: msg.MaxAcceptedHTLCs,
-		CsvDelay:         msg.CsvDelay,
+	}
+	commitParams := &channeldb.CommitmentParams{
+		DustLimit: msg.DustLimit,
+		CsvDelay:  msg.CsvDelay,
 	}
 	err = reservation.CommitConstraints(
-		channelConstraints, f.cfg.MaxLocalCSVDelay, true,
+		stateBounds, commitParams, f.cfg.MaxLocalCSVDelay, true,
 	)
 	if err != nil {
 		log.Errorf("Unacceptable channel constraints: %v", err)
@@ -1780,7 +1800,7 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	// interactively.
 	ourContribution := reservation.OurContribution()
 	forwardingPolicy := f.defaultForwardingPolicy(
-		ourContribution.ChannelConstraints,
+		ourContribution.ChannelStateBounds,
 	)
 
 	// Once the reservation has been created successfully, we add it to
@@ -1810,37 +1830,41 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	// Update the timestamp once the fundingOpenMsg has been handled.
 	defer resCtx.updateTimestamp()
 
+	cfg := channeldb.ChannelConfig{
+		ChannelStateBounds: channeldb.ChannelStateBounds{
+			MaxPendingAmount: remoteMaxValue,
+			ChanReserve:      chanReserve,
+			MinHTLC:          minHtlc,
+			MaxAcceptedHtlcs: maxHtlcs,
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: msg.DustLimit,
+			CsvDelay:  remoteCsvDelay,
+		},
+		MultiSigKey: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.FundingKey),
+		},
+		RevocationBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.RevocationPoint),
+		},
+		PaymentBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.PaymentPoint),
+		},
+		DelayBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.DelayedPaymentPoint),
+		},
+		HtlcBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.HtlcPoint),
+		},
+	}
+
 	// With our parameters set, we'll now process their contribution so we
 	// can move the funding workflow ahead.
 	remoteContribution := &lnwallet.ChannelContribution{
 		FundingAmount:        amt,
 		FirstCommitmentPoint: msg.FirstCommitmentPoint,
-		ChannelConfig: &channeldb.ChannelConfig{
-			ChannelConstraints: channeldb.ChannelConstraints{
-				DustLimit:        msg.DustLimit,
-				MaxPendingAmount: remoteMaxValue,
-				ChanReserve:      chanReserve,
-				MinHTLC:          minHtlc,
-				MaxAcceptedHtlcs: maxHtlcs,
-				CsvDelay:         remoteCsvDelay,
-			},
-			MultiSigKey: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.FundingKey),
-			},
-			RevocationBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.RevocationPoint),
-			},
-			PaymentBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.PaymentPoint),
-			},
-			DelayBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.DelayedPaymentPoint),
-			},
-			HtlcBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.HtlcPoint),
-			},
-		},
-		UpfrontShutdown: msg.UpfrontShutdownScript,
+		ChannelConfig:        &cfg,
+		UpfrontShutdown:      msg.UpfrontShutdownScript,
 	}
 
 	if resCtx.reservation.IsTaproot() {
@@ -1867,8 +1891,12 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 
 	log.Infof("Sending fundingResp for pending_id(%x)",
 		msg.PendingChannelID)
-	log.Debugf("Remote party accepted commitment constraints: %v",
-		spew.Sdump(remoteContribution.ChannelConfig.ChannelConstraints))
+	bounds := remoteContribution.ChannelConfig.ChannelStateBounds
+	log.Debugf("Remote party accepted channel state space bounds: %v",
+		lnutils.SpewLogClosure(bounds))
+	params := remoteContribution.ChannelConfig.CommitmentParams
+	log.Debugf("Remote party accepted commitment rendering params: %v",
+		lnutils.SpewLogClosure(params))
 
 	// With the initiator's contribution recorded, respond with our
 	// contribution in the next message of the workflow.
@@ -2020,34 +2048,67 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 		return
 	}
 
-	// Fail early if minimum depth is set to 0 and the channel is not
-	// zero-conf.
-	if !resCtx.reservation.IsZeroConf() && msg.MinAcceptDepth == 0 {
-		err = fmt.Errorf("non-zero-conf channel has min depth zero")
-		log.Warn(err)
-		f.failFundingFlow(peer, cid, err)
-		return
+	// If this is not a zero-conf channel but the peer responded with a
+	// min-depth of zero, we will use our minimum of 1 instead.
+	minDepth := msg.MinAcceptDepth
+	if !resCtx.reservation.IsZeroConf() && minDepth == 0 {
+		log.Infof("Responder to pending_id=%v sent a minimum "+
+			"confirmation depth of 0 for non-zero-conf channel. "+
+			"We will use a minimum depth of 1 instead.",
+			cid.tempChanID)
+
+		minDepth = 1
 	}
 
 	// We'll also specify the responder's preference for the number of
 	// required confirmations, and also the set of channel constraints
 	// they've specified for commitment states we can create.
-	resCtx.reservation.SetNumConfsRequired(uint16(msg.MinAcceptDepth))
-	channelConstraints := &channeldb.ChannelConstraints{
-		DustLimit:        msg.DustLimit,
+	resCtx.reservation.SetNumConfsRequired(uint16(minDepth))
+	bounds := channeldb.ChannelStateBounds{
 		ChanReserve:      msg.ChannelReserve,
 		MaxPendingAmount: msg.MaxValueInFlight,
 		MinHTLC:          msg.HtlcMinimum,
 		MaxAcceptedHtlcs: msg.MaxAcceptedHTLCs,
-		CsvDelay:         msg.CsvDelay,
+	}
+	commitParams := channeldb.CommitmentParams{
+		DustLimit: msg.DustLimit,
+		CsvDelay:  msg.CsvDelay,
 	}
 	err = resCtx.reservation.CommitConstraints(
-		channelConstraints, resCtx.maxLocalCsv, false,
+		&bounds, &commitParams, resCtx.maxLocalCsv, false,
 	)
 	if err != nil {
 		log.Warnf("Unacceptable channel constraints: %v", err)
 		f.failFundingFlow(peer, cid, err)
 		return
+	}
+
+	cfg := channeldb.ChannelConfig{
+		ChannelStateBounds: channeldb.ChannelStateBounds{
+			MaxPendingAmount: resCtx.remoteMaxValue,
+			ChanReserve:      resCtx.remoteChanReserve,
+			MinHTLC:          resCtx.remoteMinHtlc,
+			MaxAcceptedHtlcs: resCtx.remoteMaxHtlcs,
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: msg.DustLimit,
+			CsvDelay:  resCtx.remoteCsvDelay,
+		},
+		MultiSigKey: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.FundingKey),
+		},
+		RevocationBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.RevocationPoint),
+		},
+		PaymentBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.PaymentPoint),
+		},
+		DelayBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.DelayedPaymentPoint),
+		},
+		HtlcBasePoint: keychain.KeyDescriptor{
+			PubKey: copyPubKey(msg.HtlcPoint),
+		},
 	}
 
 	// The remote node has responded with their portion of the channel
@@ -2056,32 +2117,8 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 	// the funding transaction.
 	remoteContribution := &lnwallet.ChannelContribution{
 		FirstCommitmentPoint: msg.FirstCommitmentPoint,
-		ChannelConfig: &channeldb.ChannelConfig{
-			ChannelConstraints: channeldb.ChannelConstraints{
-				DustLimit:        msg.DustLimit,
-				MaxPendingAmount: resCtx.remoteMaxValue,
-				ChanReserve:      resCtx.remoteChanReserve,
-				MinHTLC:          resCtx.remoteMinHtlc,
-				MaxAcceptedHtlcs: resCtx.remoteMaxHtlcs,
-				CsvDelay:         resCtx.remoteCsvDelay,
-			},
-			MultiSigKey: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.FundingKey),
-			},
-			RevocationBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.RevocationPoint),
-			},
-			PaymentBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.PaymentPoint),
-			},
-			DelayBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.DelayedPaymentPoint),
-			},
-			HtlcBasePoint: keychain.KeyDescriptor{
-				PubKey: copyPubKey(msg.HtlcPoint),
-			},
-		},
-		UpfrontShutdown: msg.UpfrontShutdownScript,
+		ChannelConfig:        &cfg,
+		UpfrontShutdown:      msg.UpfrontShutdownScript,
 	}
 
 	if resCtx.reservation.IsTaproot() {
@@ -2146,8 +2183,12 @@ func (f *Manager) funderProcessAcceptChannel(peer lnpeer.Peer,
 	log.Infof("pendingChan(%x): remote party proposes num_confs=%v, "+
 		"csv_delay=%v", pendingChanID[:], msg.MinAcceptDepth,
 		msg.CsvDelay)
-	log.Debugf("Remote party accepted commitment constraints: %v",
-		spew.Sdump(remoteContribution.ChannelConfig.ChannelConstraints))
+	bounds = remoteContribution.ChannelConfig.ChannelStateBounds
+	log.Debugf("Remote party accepted channel state space bounds: %v",
+		lnutils.SpewLogClosure(bounds))
+	commitParams = remoteContribution.ChannelConfig.CommitmentParams
+	log.Debugf("Remote party accepted commitment rendering params: %v",
+		lnutils.SpewLogClosure(commitParams))
 
 	// If the user requested funding through a PSBT, we cannot directly
 	// continue now and need to wait for the fully funded and signed PSBT
@@ -2747,7 +2788,7 @@ type confirmedChannel struct {
 // channel as closed. The error is only returned for the responder of the
 // channel flow.
 func (f *Manager) fundingTimeout(c *channeldb.OpenChannel,
-	pendingID [32]byte) error {
+	pendingID PendingChanID) error {
 
 	// We'll get a timeout if the number of blocks mined since the channel
 	// was initiated reaches MaxWaitNumBlocksFundingConf and we are not the
@@ -2868,6 +2909,7 @@ func makeFundingScript(channel *channeldb.OpenChannel) ([]byte, error) {
 	if channel.ChanType.IsTaproot() {
 		pkScript, _, err := input.GenTaprootFundingScript(
 			localKey, remoteKey, int64(channel.Capacity),
+			channel.TapscriptRoot,
 		)
 		if err != nil {
 			return nil, err
@@ -3374,15 +3416,15 @@ func (f *Manager) extractAnnounceParams(c *channeldb.OpenChannel) (
 	return fwdMinHTLC, fwdMaxHTLC
 }
 
-// addToRouterGraph sends a ChannelAnnouncement and a ChannelUpdate to the
-// gossiper so that the channel is added to the Router's internal graph.
+// addToGraph sends a ChannelAnnouncement and a ChannelUpdate to the
+// gossiper so that the channel is added to the graph builder's internal graph.
 // These announcement messages are NOT broadcasted to the greater network,
 // only to the channel counter party. The proofs required to announce the
 // channel to the greater network will be created and sent in annAfterSixConfs.
 // The peerAlias is used for zero-conf channels to give the counter-party a
 // ChannelUpdate they understand. ourPolicy may be set for various
 // option-scid-alias channels to re-use the same policy.
-func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
+func (f *Manager) addToGraph(completeChan *channeldb.OpenChannel,
 	shortChanID *lnwire.ShortChannelID,
 	peerAlias *lnwire.ShortChannelID,
 	ourPolicy *models.ChannelEdgePolicy) error {
@@ -3412,10 +3454,10 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"ChannelAnnouncement: %v", err)
 			} else {
 				return fmt.Errorf("error sending channel "+
@@ -3432,10 +3474,10 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"ChannelUpdate: %v", err)
 			} else {
 				return fmt.Errorf("error sending channel "+
@@ -3451,8 +3493,8 @@ func (f *Manager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 
 // annAfterSixConfs broadcasts the necessary channel announcement messages to
 // the network after 6 confs. Should be called after the channelReady message
-// is sent and the channel is added to the router graph (channelState is
-// 'addedToRouterGraph') and the channel is ready to be used. This is the last
+// is sent and the channel is added to the graph (channelState is
+// 'addedToGraph') and the channel is ready to be used. This is the last
 // step in the channel opening process, and the opening state will be deleted
 // from the database if successful.
 func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
@@ -3563,7 +3605,7 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 			}
 
 			// We'll delete the edge and add it again via
-			// addToRouterGraph. This is because the peer may have
+			// addToGraph. This is because the peer may have
 			// sent us a ChannelUpdate with an alias and we don't
 			// want to relay this.
 			ourPolicy, err := f.cfg.DeleteAliasEdge(baseScid)
@@ -3573,12 +3615,12 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 					err)
 			}
 
-			err = f.addToRouterGraph(
+			err = f.addToGraph(
 				completeChan, &baseScid, nil, ourPolicy,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to re-add to "+
-					"router graph: %v", err)
+					"graph: %v", err)
 			}
 		}
 
@@ -3602,12 +3644,10 @@ func (f *Manager) annAfterSixConfs(completeChan *channeldb.OpenChannel,
 	return nil
 }
 
-// waitForZeroConfChannel is called when the state is addedToRouterGraph with
+// waitForZeroConfChannel is called when the state is addedToGraph with
 // a zero-conf channel. This will wait for the real confirmation, add the
-// confirmed SCID to the router graph, and then announce after six confs.
-func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel,
-	pendingID [32]byte) error {
-
+// confirmed SCID to the graph, and then announce after six confs.
+func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel) error {
 	// First we'll check whether the channel is confirmed on-chain. If it
 	// is already confirmed, the chainntnfs subsystem will return with the
 	// confirmed tx. Otherwise, we'll wait here until confirmation occurs.
@@ -3661,15 +3701,15 @@ func (f *Manager) waitForZeroConfChannel(c *channeldb.OpenChannel,
 		}
 
 		// We'll need to update the graph with the new ShortChannelID
-		// via an addToRouterGraph call. We don't pass in the peer's
+		// via an addToGraph call. We don't pass in the peer's
 		// alias since we'll be using the confirmed SCID from now on
 		// regardless if it's public or not.
-		err = f.addToRouterGraph(
+		err = f.addToGraph(
 			c, &confChan.shortChanID, nil, ourPolicy,
 		)
 		if err != nil {
 			return fmt.Errorf("failed adding confirmed zero-conf "+
-				"SCID to router graph: %v", err)
+				"SCID to graph: %v", err)
 		}
 	}
 
@@ -3971,10 +4011,10 @@ func (f *Manager) handleChannelReady(peer lnpeer.Peer, //nolint:funlen
 // handleChannelReadyReceived is called once the remote's channelReady message
 // is received and processed. At this stage, we must have sent out our
 // channelReady message, once the remote's channelReady is processed, the
-// channel is now active, thus we change its state to `addedToRouterGraph` to
+// channel is now active, thus we change its state to `addedToGraph` to
 // let the channel start handling routing.
 func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
-	scid *lnwire.ShortChannelID, pendingChanID [32]byte,
+	scid *lnwire.ShortChannelID, pendingChanID PendingChanID,
 	updateChan chan<- *lnrpc.OpenStatusUpdate) error {
 
 	chanID := lnwire.NewChanIDFromOutPoint(channel.FundingOutpoint)
@@ -4003,9 +4043,9 @@ func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 		peerAlias = &foundAlias
 	}
 
-	err := f.addToRouterGraph(channel, scid, peerAlias, nil)
+	err := f.addToGraph(channel, scid, peerAlias, nil)
 	if err != nil {
-		return fmt.Errorf("failed adding to router graph: %w", err)
+		return fmt.Errorf("failed adding to graph: %w", err)
 	}
 
 	// As the channel is now added to the ChannelRouter's topology, the
@@ -4013,15 +4053,15 @@ func (f *Manager) handleChannelReadyReceived(channel *channeldb.OpenChannel,
 	// moved to the last state (actually deleted from the database) after
 	// the channel is finally announced.
 	err = f.saveChannelOpeningState(
-		&channel.FundingOutpoint, addedToRouterGraph, scid,
+		&channel.FundingOutpoint, addedToGraph, scid,
 	)
 	if err != nil {
 		return fmt.Errorf("error setting channel state to"+
-			" addedToRouterGraph: %w", err)
+			" addedToGraph: %w", err)
 	}
 
 	log.Debugf("Channel(%v) with ShortChanID %v: successfully "+
-		"added to router graph", chanID, scid)
+		"added to graph", chanID, scid)
 
 	// Give the caller a final update notifying them that the channel is
 	fundingPoint := channel.FundingOutpoint
@@ -4069,7 +4109,7 @@ func (f *Manager) ensureInitialForwardingPolicy(chanID lnwire.ChannelID,
 			"falling back to default values: %v", err)
 
 		forwardingPolicy = f.defaultForwardingPolicy(
-			channel.LocalChanCfg.ChannelConstraints,
+			channel.LocalChanCfg.ChannelStateBounds,
 		)
 		needDBUpdate = true
 	}
@@ -4346,17 +4386,17 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 	}
 
 	// We only send the channel proof announcement and the node announcement
-	// because addToRouterGraph previously sent the ChannelAnnouncement and
+	// because addToGraph previously sent the ChannelAnnouncement and
 	// the ChannelUpdate announcement messages. The channel proof and node
 	// announcements are broadcast to the greater network.
 	errChan := f.cfg.SendAnnouncement(ann.chanProof)
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"AnnounceSignatures: %v", err)
 			} else {
 				log.Errorf("Unable to send channel "+
@@ -4383,10 +4423,10 @@ func (f *Manager) announceChannel(localIDKey, remoteIDKey *btcec.PublicKey,
 	select {
 	case err := <-errChan:
 		if err != nil {
-			if routing.IsError(err, routing.ErrOutdated,
-				routing.ErrIgnored) {
+			if graph.IsError(err, graph.ErrOutdated,
+				graph.ErrIgnored) {
 
-				log.Debugf("Router rejected "+
+				log.Debugf("Graph rejected "+
 					"NodeAnnouncement: %v", err)
 			} else {
 				log.Errorf("Unable to send node "+
@@ -4498,7 +4538,7 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 	// If the caller specified their own channel ID, then we'll use that.
 	// Otherwise we'll generate a fresh one as normal.  This will be used
 	// to track this reservation throughout its lifetime.
-	var chanID [32]byte
+	var chanID PendingChanID
 	if msg.PendingChanID == zeroID {
 		chanID = f.nextPendingChanID()
 	} else {
@@ -4694,7 +4734,7 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 	// useBaseFee or useFeeRate are false the client did not provide fee
 	// values hence we assume default fee settings from the config.
 	forwardingPolicy := f.defaultForwardingPolicy(
-		ourContribution.ChannelConstraints,
+		ourContribution.ChannelStateBounds,
 	)
 	if baseFee != nil {
 		forwardingPolicy.BaseFee = lnwire.MilliSatoshi(*baseFee)
@@ -4749,16 +4789,18 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 	defer resCtx.updateTimestamp()
 
 	// Check the sanity of the selected channel constraints.
-	channelConstraints := &channeldb.ChannelConstraints{
-		DustLimit:        ourDustLimit,
+	bounds := &channeldb.ChannelStateBounds{
 		ChanReserve:      chanReserve,
 		MaxPendingAmount: maxValue,
 		MinHTLC:          minHtlcIn,
 		MaxAcceptedHtlcs: maxHtlcs,
-		CsvDelay:         remoteCsvDelay,
+	}
+	commitParams := &channeldb.CommitmentParams{
+		DustLimit: ourDustLimit,
+		CsvDelay:  remoteCsvDelay,
 	}
 	err = lnwallet.VerifyConstraints(
-		channelConstraints, resCtx.maxLocalCsv, capacity,
+		bounds, commitParams, resCtx.maxLocalCsv, capacity,
 	)
 	if err != nil {
 		_, reserveErr := f.cancelReservationCtx(peerKey, chanID, false)
@@ -4919,7 +4961,8 @@ func (f *Manager) pruneZombieReservations() {
 // cancelReservationCtx does all needed work in order to securely cancel the
 // reservation.
 func (f *Manager) cancelReservationCtx(peerKey *btcec.PublicKey,
-	pendingChanID [32]byte, byRemote bool) (*reservationWithCtx, error) {
+	pendingChanID PendingChanID,
+	byRemote bool) (*reservationWithCtx, error) {
 
 	log.Infof("Cancelling funding reservation for node_key=%x, "+
 		"chan_id=%x", peerKey.SerializeCompressed(), pendingChanID[:])
@@ -4967,7 +5010,7 @@ func (f *Manager) cancelReservationCtx(peerKey *btcec.PublicKey,
 // deleteReservationCtx deletes the reservation uniquely identified by the
 // target public key of the peer, and the specified pending channel ID.
 func (f *Manager) deleteReservationCtx(peerKey *btcec.PublicKey,
-	pendingChanID [32]byte) {
+	pendingChanID PendingChanID) {
 
 	peerIDKey := newSerializedKey(peerKey)
 	f.resMtx.Lock()
@@ -4990,7 +5033,7 @@ func (f *Manager) deleteReservationCtx(peerKey *btcec.PublicKey,
 // getReservationCtx returns the reservation context for a particular pending
 // channel ID for a target peer.
 func (f *Manager) getReservationCtx(peerKey *btcec.PublicKey,
-	pendingChanID [32]byte) (*reservationWithCtx, error) {
+	pendingChanID PendingChanID) (*reservationWithCtx, error) {
 
 	peerIDKey := newSerializedKey(peerKey)
 	f.resMtx.RLock()
@@ -5010,7 +5053,7 @@ func (f *Manager) getReservationCtx(peerKey *btcec.PublicKey,
 // of being funded. After the funding transaction has been confirmed, the
 // channel will receive a new, permanent channel ID, and will no longer be
 // considered pending.
-func (f *Manager) IsPendingChannel(pendingChanID [32]byte,
+func (f *Manager) IsPendingChannel(pendingChanID PendingChanID,
 	peer lnpeer.Peer) bool {
 
 	peerIDKey := newSerializedKey(peer.IdentityKey())
@@ -5031,11 +5074,11 @@ func copyPubKey(pub *btcec.PublicKey) *btcec.PublicKey {
 // defaultForwardingPolicy returns the default forwarding policy based on the
 // default routing policy and our local channel constraints.
 func (f *Manager) defaultForwardingPolicy(
-	constraints channeldb.ChannelConstraints) *models.ForwardingPolicy {
+	bounds channeldb.ChannelStateBounds) *models.ForwardingPolicy {
 
 	return &models.ForwardingPolicy{
-		MinHTLCOut:    constraints.MinHTLC,
-		MaxHTLC:       constraints.MaxPendingAmount,
+		MinHTLCOut:    bounds.MinHTLC,
+		MaxHTLC:       bounds.MaxPendingAmount,
 		BaseFee:       f.cfg.DefaultRoutingPolicy.BaseFee,
 		FeeRate:       f.cfg.DefaultRoutingPolicy.FeeRate,
 		TimeLockDelta: f.cfg.DefaultRoutingPolicy.TimeLockDelta,

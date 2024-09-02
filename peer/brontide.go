@@ -36,11 +36,13 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/msgmux"
 	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/pool"
 	"github.com/lightningnetwork/lnd/queue"
@@ -370,6 +372,10 @@ type Config struct {
 	AddLocalAlias func(alias, base lnwire.ShortChannelID,
 		gossip bool) error
 
+	// AuxLeafStore is an optional store that can be used to store auxiliary
+	// leaves for certain custom channel types.
+	AuxLeafStore fn.Option[lnwallet.AuxLeafStore]
+
 	// PongBuf is a slice we'll reuse instead of allocating memory on the
 	// heap. Since only reads will occur and no writes, there is no need
 	// for any synchronization primitives. As a result, it's safe to share
@@ -380,6 +386,15 @@ type Config struct {
 	// by failing back any blinding-related payloads as if they were
 	// invalid.
 	DisallowRouteBlinding bool
+
+	// MaxFeeExposure limits the number of outstanding fees in a channel.
+	// This value will be passed to created links.
+	MaxFeeExposure lnwire.MilliSatoshi
+
+	// MsgRouter is an optional instance of the main message router that
+	// the peer will use. If None, then a new default version will be used
+	// in place.
+	MsgRouter fn.Option[msgmux.Router]
 
 	// Quit is the server's quit channel. If this is closed, we halt operation.
 	Quit chan struct{}
@@ -517,6 +532,15 @@ type Brontide struct {
 	// potentially holding lots of un-consumed events.
 	channelEventClient *subscribe.Client
 
+	// msgRouter is an instance of the msgmux.Router which is used to send
+	// off new wire messages for handing.
+	msgRouter fn.Option[msgmux.Router]
+
+	// globalMsgRouter is a flag that indicates whether we have a global
+	// msg router. If so, then we don't worry about stopping the msg router
+	// when a peer disconnects.
+	globalMsgRouter bool
+
 	startReady chan struct{}
 	quit       chan struct{}
 	wg         sync.WaitGroup
@@ -531,6 +555,17 @@ var _ lnpeer.Peer = (*Brontide)(nil)
 // NewBrontide creates a new Brontide from a peer.Config struct.
 func NewBrontide(cfg Config) *Brontide {
 	logPrefix := fmt.Sprintf("Peer(%x):", cfg.PubKeyBytes)
+
+	// We have a global message router if one was passed in via the config.
+	// In this case, we don't need to attempt to tear it down when the peer
+	// is stopped.
+	globalMsgRouter := cfg.MsgRouter.IsSome()
+
+	// We'll either use the msg router instance passed in, or create a new
+	// blank instance.
+	msgRouter := cfg.MsgRouter.Alt(fn.Some[msgmux.Router](
+		msgmux.NewMultiMsgRouter(),
+	))
 
 	p := &Brontide{
 		cfg:           cfg,
@@ -554,6 +589,8 @@ func NewBrontide(cfg Config) *Brontide {
 		startReady:         make(chan struct{}),
 		quit:               make(chan struct{}),
 		log:                build.NewPrefixLog(logPrefix, peerLog),
+		msgRouter:          msgRouter,
+		globalMsgRouter:    globalMsgRouter,
 	}
 
 	if cfg.Conn != nil && cfg.Conn.RemoteAddr() != nil {
@@ -733,6 +770,12 @@ func (p *Brontide) Start() error {
 		return err
 	}
 
+	// Register the message router now as we may need to register some
+	// endpoints while loading the channels below.
+	p.msgRouter.WhenSome(func(router msgmux.Router) {
+		router.Start()
+	})
+
 	msgs, err := p.loadActiveChannels(activeChans)
 	if err != nil {
 		return fmt.Errorf("unable to load channels: %w", err)
@@ -782,7 +825,9 @@ func (p *Brontide) Start() error {
 	//
 	// TODO(wilmer): Remove this once we're able to query for node
 	// announcements through their timestamps.
+	p.wg.Add(2)
 	go p.maybeSendNodeAnn(activeChans)
+	go p.maybeSendChannelUpdates()
 
 	return nil
 }
@@ -902,11 +947,16 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 			}
 		}
 
+		var chanOpts []lnwallet.ChannelOpt
+		p.cfg.AuxLeafStore.WhenSome(func(s lnwallet.AuxLeafStore) {
+			chanOpts = append(chanOpts, lnwallet.WithLeafStore(s))
+		})
 		lnChan, err := lnwallet.NewLightningChannel(
-			p.cfg.Signer, dbChan, p.cfg.SigPool,
+			p.cfg.Signer, dbChan, p.cfg.SigPool, chanOpts...,
 		)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("unable to create channel "+
+				"state machine: %w", err)
 		}
 
 		chanPoint := dbChan.FundingOutpoint
@@ -974,7 +1024,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 		info, p1, p2, err := graph.FetchChannelEdgesByOutpoint(
 			&chanPoint,
 		)
-		if err != nil && err != channeldb.ErrEdgeNotFound {
+		if err != nil && !errors.Is(err, channeldb.ErrEdgeNotFound) {
 			return nil, err
 		}
 
@@ -1065,7 +1115,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 
 			chanCloser, err := p.createChanCloser(
 				lnChan, info.DeliveryScript.Val, feePerKw, nil,
-				info.LocalInitiator.Val,
+				info.Closer(),
 			)
 			if err != nil {
 				shutdownInfoErr = fmt.Errorf("unable to "+
@@ -1089,7 +1139,7 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 				return
 			}
 
-			shutdownMsg = fn.Some[lnwire.Shutdown](*shutdown)
+			shutdownMsg = fn.Some(*shutdown)
 		})
 		if shutdownInfoErr != nil {
 			return nil, shutdownInfoErr
@@ -1194,6 +1244,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		GetAliases:              p.cfg.GetAliases,
 		PreviouslySentShutdown:  shutdownMsg,
 		DisallowRouteBlinding:   p.cfg.DisallowRouteBlinding,
+		MaxFeeExposure:          p.cfg.MaxFeeExposure,
 	}
 
 	// Before adding our new link, purge the switch of any pending or live
@@ -1212,6 +1263,8 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 // maybeSendNodeAnn sends our node announcement to the remote peer if at least
 // one confirmed public channel exists with them.
 func (p *Brontide) maybeSendNodeAnn(channels []*channeldb.OpenChannel) {
+	defer p.wg.Done()
+
 	hasConfirmedPublicChan := false
 	for _, channel := range channels {
 		if channel.IsPending {
@@ -1237,6 +1290,72 @@ func (p *Brontide) maybeSendNodeAnn(channels []*channeldb.OpenChannel) {
 	if err := p.SendMessageLazy(false, &ourNodeAnn); err != nil {
 		p.log.Debugf("Unable to resend node announcement: %v", err)
 	}
+}
+
+// maybeSendChannelUpdates sends our channel updates to the remote peer if we
+// have any active channels with them.
+func (p *Brontide) maybeSendChannelUpdates() {
+	defer p.wg.Done()
+
+	// If we don't have any active channels, then we can exit early.
+	if p.activeChannels.Len() == 0 {
+		return
+	}
+
+	maybeSendUpd := func(cid lnwire.ChannelID,
+		lnChan *lnwallet.LightningChannel) error {
+
+		// Nil channels are pending, so we'll skip them.
+		if lnChan == nil {
+			return nil
+		}
+
+		dbChan := lnChan.State()
+		scid := func() lnwire.ShortChannelID {
+			switch {
+			// Otherwise if it's a zero conf channel and confirmed,
+			// then we need to use the "real" scid.
+			case dbChan.IsZeroConf() && dbChan.ZeroConfConfirmed():
+				return dbChan.ZeroConfRealScid()
+
+			// Otherwise, we can use the normal scid.
+			default:
+				return dbChan.ShortChanID()
+			}
+		}()
+
+		// Now that we know the channel is in a good state, we'll try
+		// to fetch the update to send to the remote peer. If the
+		// channel is pending, and not a zero conf channel, we'll get
+		// an error here which we'll ignore.
+		chanUpd, err := p.cfg.FetchLastChanUpdate(scid)
+		if err != nil {
+			p.log.Debugf("Unable to fetch channel update for "+
+				"ChannelPoint(%v), scid=%v: %v",
+				dbChan.FundingOutpoint, dbChan.ShortChanID, err)
+
+			return nil
+		}
+
+		p.log.Debugf("Sending channel update for ChannelPoint(%v), "+
+			"scid=%v", dbChan.FundingOutpoint, dbChan.ShortChanID)
+
+		// We'll send it as a normal message instead of using the lazy
+		// queue to prioritize transmission of the fresh update.
+		if err := p.SendMessage(false, chanUpd); err != nil {
+			err := fmt.Errorf("unable to send channel update for "+
+				"ChannelPoint(%v), scid=%v: %w",
+				dbChan.FundingOutpoint, dbChan.ShortChanID(),
+				err)
+			p.log.Errorf(err.Error())
+
+			return err
+		}
+
+		return nil
+	}
+
+	p.activeChannels.ForEach(maybeSendUpd)
 }
 
 // WaitForDisconnect waits until the peer has disconnected. A peer may be
@@ -1292,6 +1411,14 @@ func (p *Brontide) Disconnect(reason error) {
 	p.cfg.Conn.Close()
 
 	close(p.quit)
+
+	// If our msg router isn't global (local to this instance), then we'll
+	// stop it. Otherwise, we'll leave it running.
+	if !p.globalMsgRouter {
+		p.msgRouter.WhenSome(func(router msgmux.Router) {
+			router.Stop()
+		})
+	}
 }
 
 // String returns the string representation of this peer.
@@ -1733,6 +1860,22 @@ out:
 			}
 		}
 
+		// If a message router is active, then we'll try to have it
+		// handle this message. If it can, then we're able to skip the
+		// rest of the message handling logic.
+		err = fn.MapOptionZ(p.msgRouter, func(r msgmux.Router) error {
+			return r.RouteMsg(msgmux.PeerMsg{
+				PeerPub: *p.IdentityKey(),
+				Message: nextMsg,
+			})
+		})
+
+		// No error occurred, and the message was handled by the
+		// router.
+		if err == nil {
+			continue
+		}
+
 		var (
 			targetChan   lnwire.ChannelID
 			isLinkUpdate bool
@@ -2138,6 +2281,10 @@ func messageSummary(msg lnwire.Message) string {
 			time.Unix(int64(msg.FirstTimestamp), 0),
 			msg.TimestampRange)
 
+	case *lnwire.Stfu:
+		return fmt.Sprintf("chan_id=%v, initiator=%v", msg.ChanID,
+			msg.Initiator)
+
 	case *lnwire.Custom:
 		return fmt.Sprintf("type=%d", msg.Type)
 	}
@@ -2156,7 +2303,7 @@ func (p *Brontide) logWireMessage(msg lnwire.Message, read bool) {
 		summaryPrefix = "Sending"
 	}
 
-	p.log.Debugf("%v", newLogClosure(func() string {
+	p.log.Debugf("%v", lnutils.NewLogClosure(func() string {
 		// Debug summary of message.
 		summary := messageSummary(msg)
 		if len(summary) > 0 {
@@ -2184,9 +2331,7 @@ func (p *Brontide) logWireMessage(msg lnwire.Message, read bool) {
 		prefix = "writeMessage to peer"
 	}
 
-	p.log.Tracef(prefix+": %v", newLogClosure(func() string {
-		return spew.Sdump(msg)
-	}))
+	p.log.Tracef(prefix+": %v", lnutils.SpewLogClosure(msg))
 }
 
 // writeMessage writes and flushes the target lnwire.Message to the remote peer.
@@ -2729,7 +2874,7 @@ func (p *Brontide) fetchActiveChanCloser(chanID lnwire.ChannelID) (
 	}
 
 	chanCloser, err = p.createChanCloser(
-		channel, deliveryScript, feePerKw, nil, false,
+		channel, deliveryScript, feePerKw, nil, lntypes.Remote,
 	)
 	if err != nil {
 		p.log.Errorf("unable to create chan closer: %v", err)
@@ -2938,7 +3083,7 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 		})
 
 	// An error other than ErrNoShutdownInfo was returned
-	case err != nil && !errors.Is(err, channeldb.ErrNoShutdownInfo):
+	case !errors.Is(err, channeldb.ErrNoShutdownInfo):
 		return nil, err
 
 	case errors.Is(err, channeldb.ErrNoShutdownInfo):
@@ -2966,12 +3111,13 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 
 	// Determine whether we or the peer are the initiator of the coop
 	// close attempt by looking at the channel's status.
-	locallyInitiated := c.HasChanStatus(
-		channeldb.ChanStatusLocalCloseInitiator,
-	)
+	closingParty := lntypes.Remote
+	if c.HasChanStatus(channeldb.ChanStatusLocalCloseInitiator) {
+		closingParty = lntypes.Local
+	}
 
 	chanCloser, err := p.createChanCloser(
-		lnChan, deliveryScript, feePerKw, nil, locallyInitiated,
+		lnChan, deliveryScript, feePerKw, nil, closingParty,
 	)
 	if err != nil {
 		p.log.Errorf("unable to create chan closer: %v", err)
@@ -3000,7 +3146,7 @@ func (p *Brontide) restartCoopClose(lnChan *lnwallet.LightningChannel) (
 func (p *Brontide) createChanCloser(channel *lnwallet.LightningChannel,
 	deliveryScript lnwire.DeliveryAddress, fee chainfee.SatPerKWeight,
 	req *htlcswitch.ChanClose,
-	locallyInitiated bool) (*chancloser.ChanCloser, error) {
+	closer lntypes.ChannelParty) (*chancloser.ChanCloser, error) {
 
 	_, startingHeight, err := p.cfg.ChainIO.GetBestBlock()
 	if err != nil {
@@ -3036,7 +3182,7 @@ func (p *Brontide) createChanCloser(channel *lnwallet.LightningChannel,
 		fee,
 		uint32(startingHeight),
 		req,
-		locallyInitiated,
+		closer,
 	)
 
 	return chanCloser, nil
@@ -3093,7 +3239,8 @@ func (p *Brontide) handleLocalCloseReq(req *htlcswitch.ChanClose) {
 		}
 
 		chanCloser, err := p.createChanCloser(
-			channel, deliveryScript, req.TargetFeePerKw, req, true,
+			channel, deliveryScript, req.TargetFeePerKw, req,
+			lntypes.Local,
 		)
 		if err != nil {
 			p.log.Errorf(err.Error())
@@ -4011,6 +4158,10 @@ func (p *Brontide) addActiveChannel(c *lnpeer.NewChannel) error {
 		// by calling SkipNonceInit.
 		chanOpts = append(chanOpts, lnwallet.WithSkipNonceInit())
 	}
+
+	p.cfg.AuxLeafStore.WhenSome(func(s lnwallet.AuxLeafStore) {
+		chanOpts = append(chanOpts, lnwallet.WithLeafStore(s))
+	})
 
 	// If not already active, we'll add this channel to the set of active
 	// channels, so we can look it up later easily according to its channel

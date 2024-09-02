@@ -22,6 +22,7 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntest/channels"
@@ -958,7 +959,7 @@ func initBreachedState(t *testing.T) (*BreachArbitrator,
 	// Create a pair of channels using a notifier that allows us to signal
 	// a spend of the funding transaction. Alice's channel will be the on
 	// observing a breach.
-	alice, bob, err := createInitChannels(t, 1)
+	alice, bob, err := createInitChannels(t)
 	require.NoError(t, err, "unable to create test channels")
 
 	// Instantiate a breach arbiter to handle the breach of alice's channel.
@@ -1590,6 +1591,7 @@ func testBreachSpends(t *testing.T, test breachTest) {
 	// Notify the breach arbiter about the breach.
 	retribution, err := lnwallet.NewBreachRetribution(
 		alice.State(), height, 1, forceCloseTx,
+		fn.Some[lnwallet.AuxLeafStore](&lnwallet.MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create breach retribution")
 
@@ -1799,6 +1801,7 @@ func TestBreachDelayedJusticeConfirmation(t *testing.T) {
 	// Notify the breach arbiter about the breach.
 	retribution, err := lnwallet.NewBreachRetribution(
 		alice.State(), height, uint32(blockHeight), forceCloseTx,
+		fn.Some[lnwallet.AuxLeafStore](&lnwallet.MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create breach retribution")
 
@@ -2150,7 +2153,7 @@ func createTestArbiter(t *testing.T, contractBreaches chan *ContractBreachEvent,
 // createInitChannels creates two initialized test channels funded with 10 BTC,
 // with 5 BTC allocated to each side. Within the channel, Alice is the
 // initiator.
-func createInitChannels(t *testing.T, revocationWindow int) (
+func createInitChannels(t *testing.T) (
 	*lnwallet.LightningChannel, *lnwallet.LightningChannel, error) {
 
 	aliceKeyPriv, aliceKeyPub := btcec.PrivKeyFromBytes(
@@ -2178,13 +2181,15 @@ func createInitChannels(t *testing.T, revocationWindow int) (
 	fundingTxIn := wire.NewTxIn(prevOut, nil, nil)
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        aliceDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutAlice),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: aliceDustLimit,
+			CsvDelay:  uint16(csvTimeoutAlice),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
@@ -2203,13 +2208,15 @@ func createInitChannels(t *testing.T, revocationWindow int) (
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: channeldb.ChannelConstraints{
-			DustLimit:        bobDustLimit,
+		ChannelStateBounds: channeldb.ChannelStateBounds{
 			MaxPendingAmount: lnwire.MilliSatoshi(rand.Int63()),
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
-			CsvDelay:         uint16(csvTimeoutBob),
+		},
+		CommitmentParams: channeldb.CommitmentParams{
+			DustLimit: bobDustLimit,
+			CsvDelay:  uint16(csvTimeoutBob),
 		},
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
@@ -2395,7 +2402,7 @@ func createInitChannels(t *testing.T, revocationWindow int) (
 
 	// Now that the channel are open, simulate the start of a session by
 	// having Alice and Bob extend their revocation windows to each other.
-	err = initRevocationWindows(channelAlice, channelBob, revocationWindow)
+	err = initRevocationWindows(channelAlice, channelBob)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2408,7 +2415,7 @@ func createInitChannels(t *testing.T, revocationWindow int) (
 // commitment state machines.
 //
 // TODO(conner) remove code duplication
-func initRevocationWindows(chanA, chanB *lnwallet.LightningChannel, windowSize int) error {
+func initRevocationWindows(chanA, chanB *lnwallet.LightningChannel) error {
 	aliceNextRevoke, err := chanA.NextRevocationKey()
 	if err != nil {
 		return err

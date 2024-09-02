@@ -18,6 +18,7 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -125,8 +126,7 @@ type Utxo struct {
 	Confirmations int64
 	PkScript      []byte
 	wire.OutPoint
-	Derivation *psbt.Bip32Derivation
-	PrevTx     *wire.MsgTx
+	PrevTx *wire.MsgTx
 }
 
 // OutputDetail contains additional information on a destination address.
@@ -226,11 +226,16 @@ type TransactionSubscription interface {
 // behavior of all interface methods in order to ensure identical behavior
 // across all concrete implementations.
 type WalletController interface {
-	// FetchInputInfo queries for the WalletController's knowledge of the
-	// passed outpoint. If the base wallet determines this output is under
-	// its control, then the original txout should be returned.  Otherwise,
-	// a non-nil error value of ErrNotMine should be returned instead.
-	FetchInputInfo(prevOut *wire.OutPoint) (*Utxo, error)
+	// FetchOutpointInfo queries for the WalletController's knowledge of
+	// the passed outpoint. If the base wallet determines this output is
+	// under its control, then the original txout should be returned.
+	// Otherwise, a non-nil error value of ErrNotMine should be returned
+	// instead.
+	FetchOutpointInfo(prevOut *wire.OutPoint) (*Utxo, error)
+
+	// FetchDerivationInfo queries for the wallet's knowledge of the passed
+	// pkScript and constructs the derivation info and returns it.
+	FetchDerivationInfo(pkScript []byte) (*psbt.Bip32Derivation, error)
 
 	// ScriptForOutput returns the address, witness program and redeem
 	// script for a given UTXO. An error is returned if the UTXO does not
@@ -344,8 +349,8 @@ type WalletController interface {
 	// be used when crafting the transaction.
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
-	SendOutputs(outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
-		minConfs int32, label string,
+	SendOutputs(inputs fn.Set[wire.OutPoint], outputs []*wire.TxOut,
+		feeRate chainfee.SatPerKWeight, minConfs int32, label string,
 		strategy base.CoinSelectionStrategy) (*wire.MsgTx, error)
 
 	// CreateSimpleTx creates a Bitcoin transaction paying to the specified
@@ -360,9 +365,10 @@ type WalletController interface {
 	// SHOULD NOT be broadcasted.
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
-	CreateSimpleTx(outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
-		minConfs int32, strategy base.CoinSelectionStrategy,
-		dryRun bool) (*txauthor.AuthoredTx, error)
+	CreateSimpleTx(inputs fn.Set[wire.OutPoint], outputs []*wire.TxOut,
+		feeRate chainfee.SatPerKWeight, minConfs int32,
+		strategy base.CoinSelectionStrategy, dryRun bool) (
+		*txauthor.AuthoredTx, error)
 
 	// GetTransactionDetails returns a detailed description of a transaction
 	// given its transaction hash.
@@ -407,8 +413,7 @@ type WalletController interface {
 	//
 	// NOTE: This method requires the global coin selection lock to be held.
 	LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
-		duration time.Duration) (time.Time, []byte, btcutil.Amount,
-		error)
+		duration time.Duration) (time.Time, error)
 
 	// ReleaseOutput unlocks an output, allowing it to be available for coin
 	// selection if it remains unspent. The ID should match the one used to

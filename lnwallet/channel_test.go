@@ -2,7 +2,7 @@ package lnwallet
 
 import (
 	"bytes"
-	"container/list"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"math/rand"
@@ -21,6 +21,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -334,21 +335,23 @@ func testAddSettleWorkflow(t *testing.T, tweakless bool,
 	// The logs of both sides should now be cleared since the entry adding
 	// the HTLC should have been removed once both sides receive the
 	// revocation.
-	if aliceChannel.localUpdateLog.Len() != 0 {
+	if aliceChannel.updateLogs.Local.Len() != 0 {
 		t.Fatalf("alice's local not updated, should be empty, has %v "+
-			"entries instead", aliceChannel.localUpdateLog.Len())
+			"entries instead", aliceChannel.updateLogs.Local.Len())
 	}
-	if aliceChannel.remoteUpdateLog.Len() != 0 {
+	if aliceChannel.updateLogs.Remote.Len() != 0 {
 		t.Fatalf("alice's remote not updated, should be empty, has %v "+
-			"entries instead", aliceChannel.remoteUpdateLog.Len())
+			"entries instead", aliceChannel.updateLogs.Remote.Len())
 	}
-	if len(aliceChannel.localUpdateLog.updateIndex) != 0 {
-		t.Fatalf("alice's local log index not cleared, should be empty but "+
-			"has %v entries", len(aliceChannel.localUpdateLog.updateIndex))
+	if len(aliceChannel.updateLogs.Local.updateIndex) != 0 {
+		t.Fatalf("alice's local log index not cleared, should be "+
+			"empty but has %v entries",
+			len(aliceChannel.updateLogs.Local.updateIndex))
 	}
-	if len(aliceChannel.remoteUpdateLog.updateIndex) != 0 {
-		t.Fatalf("alice's remote log index not cleared, should be empty but "+
-			"has %v entries", len(aliceChannel.remoteUpdateLog.updateIndex))
+	if len(aliceChannel.updateLogs.Remote.updateIndex) != 0 {
+		t.Fatalf("alice's remote log index not cleared, should be "+
+			"empty but has %v entries",
+			len(aliceChannel.updateLogs.Remote.updateIndex))
 	}
 }
 
@@ -384,6 +387,12 @@ func TestSimpleAddSettleWorkflow(t *testing.T) {
 		testAddSettleWorkflow(
 			t, true, channeldb.SimpleTaprootFeatureBit, false,
 		)
+	})
+
+	t.Run("taproot with tapscript root", func(t *testing.T) {
+		flags := channeldb.SimpleTaprootFeatureBit |
+			channeldb.TapscriptRootBit
+		testAddSettleWorkflow(t, true, flags, false)
 	})
 
 	t.Run("storeFinalHtlcResolutions=true", func(t *testing.T) {
@@ -706,7 +715,7 @@ func TestCooperativeChannelClosure(t *testing.T) {
 		testCoopClose(t, &coopCloseTestCase{
 			chanType: channeldb.SingleFunderTweaklessBit |
 				channeldb.AnchorOutputsBit,
-			anchorAmt: anchorSize * 2,
+			anchorAmt: AnchorSize * 2,
 		})
 	})
 }
@@ -816,7 +825,7 @@ func TestForceClose(t *testing.T) {
 			chanType: channeldb.SingleFunderTweaklessBit |
 				channeldb.AnchorOutputsBit,
 			expectedCommitWeight: input.AnchorCommitWeight,
-			anchorAmt:            anchorSize * 2,
+			anchorAmt:            AnchorSize * 2,
 		})
 	})
 	t.Run("taproot", func(t *testing.T) {
@@ -825,7 +834,17 @@ func TestForceClose(t *testing.T) {
 				channeldb.AnchorOutputsBit |
 				channeldb.SimpleTaprootFeatureBit,
 			expectedCommitWeight: input.TaprootCommitWeight,
-			anchorAmt:            anchorSize * 2,
+			anchorAmt:            AnchorSize * 2,
+		})
+	})
+	t.Run("taproot with tapscript root", func(t *testing.T) {
+		testForceClose(t, &forceCloseTestCase{
+			chanType: channeldb.SingleFunderTweaklessBit |
+				channeldb.AnchorOutputsBit |
+				channeldb.SimpleTaprootFeatureBit |
+				channeldb.TapscriptRootBit,
+			expectedCommitWeight: input.TaprootCommitWeight,
+			anchorAmt:            AnchorSize * 2,
 		})
 	})
 }
@@ -911,7 +930,7 @@ func testForceClose(t *testing.T, testCase *forceCloseTestCase) {
 			t.Fatal("commit tx not referenced by anchor res")
 		}
 		if anchorRes.AnchorSignDescriptor.Output.Value !=
-			int64(anchorSize) {
+			int64(AnchorSize) {
 
 			t.Fatal("unexpected anchor size")
 		}
@@ -1418,12 +1437,12 @@ func TestHTLCDustLimit(t *testing.T) {
 	// while Bob's should not, because the value falls beneath his dust
 	// limit. The amount of the HTLC should be applied to fees in Bob's
 	// commitment transaction.
-	aliceCommitment := aliceChannel.localCommitChain.tip()
+	aliceCommitment := aliceChannel.commitChains.Local.tip()
 	if len(aliceCommitment.txn.TxOut) != 3 {
 		t.Fatalf("incorrect # of outputs: expected %v, got %v",
 			3, len(aliceCommitment.txn.TxOut))
 	}
-	bobCommitment := bobChannel.localCommitChain.tip()
+	bobCommitment := bobChannel.commitChains.Local.tip()
 	if len(bobCommitment.txn.TxOut) != 2 {
 		t.Fatalf("incorrect # of outputs: expected %v, got %v",
 			2, len(bobCommitment.txn.TxOut))
@@ -1448,7 +1467,7 @@ func TestHTLCDustLimit(t *testing.T) {
 
 	// At this point, for Alice's commitment chains, the value of the HTLC
 	// should have been added to Alice's balance and TotalSatoshisSent.
-	commitment := aliceChannel.localCommitChain.tip()
+	commitment := aliceChannel.commitChains.Local.tip()
 	if len(commitment.txn.TxOut) != 2 {
 		t.Fatalf("incorrect # of outputs: expected %v, got %v",
 			2, len(commitment.txn.TxOut))
@@ -1681,7 +1700,7 @@ func TestChannelBalanceDustLimit(t *testing.T) {
 	// output for Alice's balance should have been removed as dust, leaving
 	// only a single output that will send the remaining funds in the
 	// channel to Bob.
-	commitment := bobChannel.localCommitChain.tip()
+	commitment := bobChannel.commitChains.Local.tip()
 	if len(commitment.txn.TxOut) != 1 {
 		t.Fatalf("incorrect # of outputs: expected %v, got %v",
 			1, len(commitment.txn.TxOut))
@@ -1756,26 +1775,26 @@ func TestStateUpdatePersistence(t *testing.T) {
 	// Helper method that asserts the expected number of updates are found
 	// in the update logs.
 	assertNumLogUpdates := func(numAliceUpdates, numBobUpdates int) {
-		if aliceChannel.localUpdateLog.Len() != numAliceUpdates {
+		if aliceChannel.updateLogs.Local.Len() != numAliceUpdates {
 			t.Fatalf("expected %d local updates, found %d",
 				numAliceUpdates,
-				aliceChannel.localUpdateLog.Len())
+				aliceChannel.updateLogs.Local.Len())
 		}
-		if aliceChannel.remoteUpdateLog.Len() != numBobUpdates {
+		if aliceChannel.updateLogs.Remote.Len() != numBobUpdates {
 			t.Fatalf("expected %d remote updates, found %d",
 				numBobUpdates,
-				aliceChannel.remoteUpdateLog.Len())
+				aliceChannel.updateLogs.Remote.Len())
 		}
 
-		if bobChannel.localUpdateLog.Len() != numBobUpdates {
+		if bobChannel.updateLogs.Local.Len() != numBobUpdates {
 			t.Fatalf("expected %d local updates, found %d",
 				numBobUpdates,
-				bobChannel.localUpdateLog.Len())
+				bobChannel.updateLogs.Local.Len())
 		}
-		if bobChannel.remoteUpdateLog.Len() != numAliceUpdates {
+		if bobChannel.updateLogs.Remote.Len() != numAliceUpdates {
 			t.Fatalf("expected %d remote updates, found %d",
 				numAliceUpdates,
-				bobChannel.remoteUpdateLog.Len())
+				bobChannel.updateLogs.Remote.Len())
 		}
 	}
 
@@ -1799,25 +1818,25 @@ func TestStateUpdatePersistence(t *testing.T) {
 
 	// After the state transition the fee update is fully locked in, and
 	// should've been removed from both channels' update logs.
-	if aliceChannel.localCommitChain.tail().feePerKw != fee {
+	if aliceChannel.commitChains.Local.tail().feePerKw != fee {
 		t.Fatalf("fee not locked in")
 	}
-	if bobChannel.localCommitChain.tail().feePerKw != fee {
+	if bobChannel.commitChains.Local.tail().feePerKw != fee {
 		t.Fatalf("fee not locked in")
 	}
 	assertNumLogUpdates(3, 1)
 
 	// The latest commitment from both sides should have all the HTLCs.
-	numAliceOutgoing := aliceChannel.localCommitChain.tail().outgoingHTLCs
-	numAliceIncoming := aliceChannel.localCommitChain.tail().incomingHTLCs
+	numAliceOutgoing := aliceChannel.commitChains.Local.tail().outgoingHTLCs
+	numAliceIncoming := aliceChannel.commitChains.Local.tail().incomingHTLCs
 	if len(numAliceOutgoing) != 3 {
 		t.Fatalf("expected %v htlcs, instead got %v", 3, numAliceOutgoing)
 	}
 	if len(numAliceIncoming) != 1 {
 		t.Fatalf("expected %v htlcs, instead got %v", 1, numAliceIncoming)
 	}
-	numBobOutgoing := bobChannel.localCommitChain.tail().outgoingHTLCs
-	numBobIncoming := bobChannel.localCommitChain.tail().incomingHTLCs
+	numBobOutgoing := bobChannel.commitChains.Local.tail().outgoingHTLCs
+	numBobIncoming := bobChannel.commitChains.Local.tail().incomingHTLCs
 	if len(numBobOutgoing) != 1 {
 		t.Fatalf("expected %v htlcs, instead got %v", 1, numBobOutgoing)
 	}
@@ -1851,62 +1870,72 @@ func TestStateUpdatePersistence(t *testing.T) {
 
 	// The state update logs of the new channels and the old channels
 	// should now be identical other than the height the HTLCs were added.
-	if aliceChannel.localUpdateLog.logIndex !=
-		aliceChannelNew.localUpdateLog.logIndex {
+	if aliceChannel.updateLogs.Local.logIndex !=
+		aliceChannelNew.updateLogs.Local.logIndex {
+
 		t.Fatalf("alice log counter: expected %v, got %v",
-			aliceChannel.localUpdateLog.logIndex,
-			aliceChannelNew.localUpdateLog.logIndex)
+			aliceChannel.updateLogs.Local.logIndex,
+			aliceChannelNew.updateLogs.Local.logIndex)
 	}
-	if aliceChannel.remoteUpdateLog.logIndex !=
-		aliceChannelNew.remoteUpdateLog.logIndex {
+	if aliceChannel.updateLogs.Remote.logIndex !=
+		aliceChannelNew.updateLogs.Remote.logIndex {
+
 		t.Fatalf("alice log counter: expected %v, got %v",
-			aliceChannel.remoteUpdateLog.logIndex,
-			aliceChannelNew.remoteUpdateLog.logIndex)
+			aliceChannel.updateLogs.Remote.logIndex,
+			aliceChannelNew.updateLogs.Remote.logIndex)
 	}
-	if aliceChannel.localUpdateLog.Len() !=
-		aliceChannelNew.localUpdateLog.Len() {
+	if aliceChannel.updateLogs.Local.Len() !=
+		aliceChannelNew.updateLogs.Local.Len() {
+
 		t.Fatalf("alice log len: expected %v, got %v",
-			aliceChannel.localUpdateLog.Len(),
-			aliceChannelNew.localUpdateLog.Len())
+			aliceChannel.updateLogs.Local.Len(),
+			aliceChannelNew.updateLogs.Local.Len())
 	}
-	if aliceChannel.remoteUpdateLog.Len() !=
-		aliceChannelNew.remoteUpdateLog.Len() {
+	if aliceChannel.updateLogs.Remote.Len() !=
+		aliceChannelNew.updateLogs.Remote.Len() {
+
 		t.Fatalf("alice log len: expected %v, got %v",
-			aliceChannel.remoteUpdateLog.Len(),
-			aliceChannelNew.remoteUpdateLog.Len())
+			aliceChannel.updateLogs.Remote.Len(),
+			aliceChannelNew.updateLogs.Remote.Len())
 	}
-	if bobChannel.localUpdateLog.logIndex !=
-		bobChannelNew.localUpdateLog.logIndex {
+	if bobChannel.updateLogs.Local.logIndex !=
+		bobChannelNew.updateLogs.Local.logIndex {
+
 		t.Fatalf("bob log counter: expected %v, got %v",
-			bobChannel.localUpdateLog.logIndex,
-			bobChannelNew.localUpdateLog.logIndex)
+			bobChannel.updateLogs.Local.logIndex,
+			bobChannelNew.updateLogs.Local.logIndex)
 	}
-	if bobChannel.remoteUpdateLog.logIndex !=
-		bobChannelNew.remoteUpdateLog.logIndex {
+	if bobChannel.updateLogs.Remote.logIndex !=
+		bobChannelNew.updateLogs.Remote.logIndex {
+
 		t.Fatalf("bob log counter: expected %v, got %v",
-			bobChannel.remoteUpdateLog.logIndex,
-			bobChannelNew.remoteUpdateLog.logIndex)
+			bobChannel.updateLogs.Remote.logIndex,
+			bobChannelNew.updateLogs.Remote.logIndex)
 	}
-	if bobChannel.localUpdateLog.Len() !=
-		bobChannelNew.localUpdateLog.Len() {
+	if bobChannel.updateLogs.Local.Len() !=
+		bobChannelNew.updateLogs.Local.Len() {
+
 		t.Fatalf("bob log len: expected %v, got %v",
-			bobChannel.localUpdateLog.Len(),
-			bobChannelNew.localUpdateLog.Len())
+			bobChannel.updateLogs.Local.Len(),
+			bobChannelNew.updateLogs.Local.Len())
 	}
-	if bobChannel.remoteUpdateLog.Len() !=
-		bobChannelNew.remoteUpdateLog.Len() {
+	if bobChannel.updateLogs.Remote.Len() !=
+		bobChannelNew.updateLogs.Remote.Len() {
+
 		t.Fatalf("bob log len: expected %v, got %v",
-			bobChannel.remoteUpdateLog.Len(),
-			bobChannelNew.remoteUpdateLog.Len())
+			bobChannel.updateLogs.Remote.Len(),
+			bobChannelNew.updateLogs.Remote.Len())
 	}
 
 	// TODO(roasbeef): expand test to also ensure state revocation log has
 	// proper pk scripts
 
 	// Newly generated pkScripts for HTLCs should be the same as in the old channel.
-	for _, entry := range aliceChannel.localUpdateLog.htlcIndex {
-		htlc := entry.Value.(*PaymentDescriptor)
-		restoredHtlc := aliceChannelNew.localUpdateLog.lookupHtlc(htlc.HtlcIndex)
+	for _, entry := range aliceChannel.updateLogs.Local.htlcIndex {
+		htlc := entry.Value
+		restoredHtlc := aliceChannelNew.updateLogs.Local.lookupHtlc(
+			htlc.HtlcIndex,
+		)
 		if !bytes.Equal(htlc.ourPkScript, restoredHtlc.ourPkScript) {
 			t.Fatalf("alice ourPkScript in ourLog: expected %X, got %X",
 				htlc.ourPkScript[:5], restoredHtlc.ourPkScript[:5])
@@ -1916,9 +1945,11 @@ func TestStateUpdatePersistence(t *testing.T) {
 				htlc.theirPkScript[:5], restoredHtlc.theirPkScript[:5])
 		}
 	}
-	for _, entry := range aliceChannel.remoteUpdateLog.htlcIndex {
-		htlc := entry.Value.(*PaymentDescriptor)
-		restoredHtlc := aliceChannelNew.remoteUpdateLog.lookupHtlc(htlc.HtlcIndex)
+	for _, entry := range aliceChannel.updateLogs.Remote.htlcIndex {
+		htlc := entry.Value
+		restoredHtlc := aliceChannelNew.updateLogs.Remote.lookupHtlc(
+			htlc.HtlcIndex,
+		)
 		if !bytes.Equal(htlc.ourPkScript, restoredHtlc.ourPkScript) {
 			t.Fatalf("alice ourPkScript in theirLog: expected %X, got %X",
 				htlc.ourPkScript[:5], restoredHtlc.ourPkScript[:5])
@@ -1928,9 +1959,11 @@ func TestStateUpdatePersistence(t *testing.T) {
 				htlc.theirPkScript[:5], restoredHtlc.theirPkScript[:5])
 		}
 	}
-	for _, entry := range bobChannel.localUpdateLog.htlcIndex {
-		htlc := entry.Value.(*PaymentDescriptor)
-		restoredHtlc := bobChannelNew.localUpdateLog.lookupHtlc(htlc.HtlcIndex)
+	for _, entry := range bobChannel.updateLogs.Local.htlcIndex {
+		htlc := entry.Value
+		restoredHtlc := bobChannelNew.updateLogs.Local.lookupHtlc(
+			htlc.HtlcIndex,
+		)
 		if !bytes.Equal(htlc.ourPkScript, restoredHtlc.ourPkScript) {
 			t.Fatalf("bob ourPkScript in ourLog: expected %X, got %X",
 				htlc.ourPkScript[:5], restoredHtlc.ourPkScript[:5])
@@ -1940,9 +1973,11 @@ func TestStateUpdatePersistence(t *testing.T) {
 				htlc.theirPkScript[:5], restoredHtlc.theirPkScript[:5])
 		}
 	}
-	for _, entry := range bobChannel.remoteUpdateLog.htlcIndex {
-		htlc := entry.Value.(*PaymentDescriptor)
-		restoredHtlc := bobChannelNew.remoteUpdateLog.lookupHtlc(htlc.HtlcIndex)
+	for _, entry := range bobChannel.updateLogs.Remote.htlcIndex {
+		htlc := entry.Value
+		restoredHtlc := bobChannelNew.updateLogs.Remote.lookupHtlc(
+			htlc.HtlcIndex,
+		)
 		if !bytes.Equal(htlc.ourPkScript, restoredHtlc.ourPkScript) {
 			t.Fatalf("bob ourPkScript in theirLog: expected %X, got %X",
 				htlc.ourPkScript[:5], restoredHtlc.ourPkScript[:5])
@@ -2073,20 +2108,24 @@ func TestCancelHTLC(t *testing.T) {
 
 	// Now HTLCs should be present on the commitment transaction for either
 	// side.
-	if len(aliceChannel.localCommitChain.tip().outgoingHTLCs) != 0 ||
-		len(aliceChannel.remoteCommitChain.tip().outgoingHTLCs) != 0 {
+	if len(aliceChannel.commitChains.Local.tip().outgoingHTLCs) != 0 ||
+		len(aliceChannel.commitChains.Remote.tip().outgoingHTLCs) != 0 {
+
 		t.Fatalf("htlc's still active from alice's POV")
 	}
-	if len(aliceChannel.localCommitChain.tip().incomingHTLCs) != 0 ||
-		len(aliceChannel.remoteCommitChain.tip().incomingHTLCs) != 0 {
+	if len(aliceChannel.commitChains.Local.tip().incomingHTLCs) != 0 ||
+		len(aliceChannel.commitChains.Remote.tip().incomingHTLCs) != 0 {
+
 		t.Fatalf("htlc's still active from alice's POV")
 	}
-	if len(bobChannel.localCommitChain.tip().outgoingHTLCs) != 0 ||
-		len(bobChannel.remoteCommitChain.tip().outgoingHTLCs) != 0 {
+	if len(bobChannel.commitChains.Local.tip().outgoingHTLCs) != 0 ||
+		len(bobChannel.commitChains.Remote.tip().outgoingHTLCs) != 0 {
+
 		t.Fatalf("htlc's still active from bob's POV")
 	}
-	if len(bobChannel.localCommitChain.tip().incomingHTLCs) != 0 ||
-		len(bobChannel.remoteCommitChain.tip().incomingHTLCs) != 0 {
+	if len(bobChannel.commitChains.Local.tip().incomingHTLCs) != 0 ||
+		len(bobChannel.commitChains.Remote.tip().incomingHTLCs) != 0 {
+
 		t.Fatalf("htlc's still active from bob's POV")
 	}
 
@@ -3224,39 +3263,39 @@ func TestChanSyncOweCommitment(t *testing.T) {
 	// Alice's local log counter should be 4 and her HTLC index 3. She
 	// should detect Bob's remote log counter as being 3 and his HTLC index
 	// 3 as well.
-	if aliceChannel.localUpdateLog.logIndex != 4 {
+	if aliceChannel.updateLogs.Local.logIndex != 4 {
 		t.Fatalf("incorrect log index: expected %v, got %v", 4,
-			aliceChannel.localUpdateLog.logIndex)
+			aliceChannel.updateLogs.Local.logIndex)
 	}
-	if aliceChannel.localUpdateLog.htlcCounter != 1 {
+	if aliceChannel.updateLogs.Local.htlcCounter != 1 {
 		t.Fatalf("incorrect htlc index: expected %v, got %v", 1,
-			aliceChannel.localUpdateLog.htlcCounter)
+			aliceChannel.updateLogs.Local.htlcCounter)
 	}
-	if aliceChannel.remoteUpdateLog.logIndex != 3 {
+	if aliceChannel.updateLogs.Remote.logIndex != 3 {
 		t.Fatalf("incorrect log index: expected %v, got %v", 3,
-			aliceChannel.localUpdateLog.logIndex)
+			aliceChannel.updateLogs.Local.logIndex)
 	}
-	if aliceChannel.remoteUpdateLog.htlcCounter != 3 {
+	if aliceChannel.updateLogs.Remote.htlcCounter != 3 {
 		t.Fatalf("incorrect htlc index: expected %v, got %v", 3,
-			aliceChannel.localUpdateLog.htlcCounter)
+			aliceChannel.updateLogs.Local.htlcCounter)
 	}
 
 	// Bob should also have the same state, but mirrored.
-	if bobChannel.localUpdateLog.logIndex != 3 {
+	if bobChannel.updateLogs.Local.logIndex != 3 {
 		t.Fatalf("incorrect log index: expected %v, got %v", 3,
-			bobChannel.localUpdateLog.logIndex)
+			bobChannel.updateLogs.Local.logIndex)
 	}
-	if bobChannel.localUpdateLog.htlcCounter != 3 {
+	if bobChannel.updateLogs.Local.htlcCounter != 3 {
 		t.Fatalf("incorrect htlc index: expected %v, got %v", 3,
-			bobChannel.localUpdateLog.htlcCounter)
+			bobChannel.updateLogs.Local.htlcCounter)
 	}
-	if bobChannel.remoteUpdateLog.logIndex != 4 {
+	if bobChannel.updateLogs.Remote.logIndex != 4 {
 		t.Fatalf("incorrect log index: expected %v, got %v", 4,
-			bobChannel.localUpdateLog.logIndex)
+			bobChannel.updateLogs.Local.logIndex)
 	}
-	if bobChannel.remoteUpdateLog.htlcCounter != 1 {
+	if bobChannel.updateLogs.Remote.htlcCounter != 1 {
 		t.Fatalf("incorrect htlc index: expected %v, got %v", 1,
-			bobChannel.localUpdateLog.htlcCounter)
+			bobChannel.updateLogs.Local.htlcCounter)
 	}
 
 	// We'll conclude the test by having Bob settle Alice's HTLC, then
@@ -4471,7 +4510,7 @@ func TestFeeUpdateOldDiskFormat(t *testing.T) {
 	countLog := func(log *updateLog) (int, int) {
 		var numUpdates, numFee int
 		for e := log.Front(); e != nil; e = e.Next() {
-			htlc := e.Value.(*PaymentDescriptor)
+			htlc := e.Value
 			if htlc.EntryType == FeeUpdate {
 				numFee++
 			}
@@ -4486,7 +4525,7 @@ func TestFeeUpdateOldDiskFormat(t *testing.T) {
 		t.Helper()
 
 		expUpd := expFee + expAdd
-		upd, fees := countLog(aliceChannel.localUpdateLog)
+		upd, fees := countLog(aliceChannel.updateLogs.Local)
 		if upd != expUpd {
 			t.Fatalf("expected %d updates, found %d in Alice's "+
 				"log", expUpd, upd)
@@ -4495,7 +4534,7 @@ func TestFeeUpdateOldDiskFormat(t *testing.T) {
 			t.Fatalf("expected %d fee updates, found %d in "+
 				"Alice's log", expFee, fees)
 		}
-		upd, fees = countLog(bobChannel.remoteUpdateLog)
+		upd, fees = countLog(bobChannel.updateLogs.Remote)
 		if upd != expUpd {
 			t.Fatalf("expected %d updates, found %d in Bob's log",
 				expUpd, upd)
@@ -5190,12 +5229,14 @@ func TestChanCommitWeightDustHtlcs(t *testing.T) {
 	// When sending htlcs we enforce the feebuffer on the commitment
 	// transaction.
 	remoteCommitWeight := func(lc *LightningChannel) lntypes.WeightUnit {
-		remoteACKedIndex := lc.localCommitChain.tip().theirMessageIndex
+		remoteACKedIndex :=
+			lc.commitChains.Local.tip().messageIndices.Remote
+
 		htlcView := lc.fetchHTLCView(remoteACKedIndex,
-			lc.localUpdateLog.logIndex)
+			lc.updateLogs.Local.logIndex)
 
 		_, w := lc.availableCommitmentBalance(
-			htlcView, true, FeeBuffer,
+			htlcView, lntypes.Remote, FeeBuffer,
 		)
 
 		return w
@@ -5678,6 +5719,7 @@ func TestChannelUnilateralCloseHtlcResolution(t *testing.T) {
 		spendDetail,
 		aliceChannel.channelState.RemoteCommitment,
 		aliceChannel.channelState.RemoteCurrentRevocation,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create alice close summary")
 
@@ -5812,7 +5854,7 @@ func TestChannelUnilateralClosePendingCommit(t *testing.T) {
 	// At this point, Alice's commitment chain should have a new pending
 	// commit for Bob. We'll extract it so we can simulate Bob broadcasting
 	// the commitment due to an issue.
-	bobCommit := aliceChannel.remoteCommitChain.tip().txn
+	bobCommit := aliceChannel.commitChains.Remote.tip().txn
 	bobTxHash := bobCommit.TxHash()
 	spendDetail := &chainntnfs.SpendDetail{
 		SpenderTxHash: &bobTxHash,
@@ -5827,6 +5869,7 @@ func TestChannelUnilateralClosePendingCommit(t *testing.T) {
 		spendDetail,
 		aliceChannel.channelState.RemoteCommitment,
 		aliceChannel.channelState.RemoteCurrentRevocation,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create alice close summary")
 
@@ -5844,6 +5887,7 @@ func TestChannelUnilateralClosePendingCommit(t *testing.T) {
 		spendDetail,
 		aliceRemoteChainTip.Commitment,
 		aliceChannel.channelState.RemoteNextRevocation,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create alice close summary")
 
@@ -6724,6 +6768,7 @@ func TestNewBreachRetributionSkipsDustHtlcs(t *testing.T) {
 	breachTx := aliceChannel.channelState.RemoteCommitment.CommitTx
 	breachRet, err := NewBreachRetribution(
 		aliceChannel.channelState, revokedStateNum, 100, breachTx,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err, "unable to create breach retribution")
 
@@ -6754,14 +6799,14 @@ func compareHtlcs(htlc1, htlc2 *PaymentDescriptor) error {
 }
 
 // compareIndexes is a helper method to compare two index maps.
-func compareIndexes(a, b map[uint64]*list.Element) error {
+func compareIndexes(a, b map[uint64]*fn.Node[*PaymentDescriptor]) error {
 	for k1, e1 := range a {
 		e2, ok := b[k1]
 		if !ok {
 			return fmt.Errorf("element with key %d "+
 				"not found in b", k1)
 		}
-		htlc1, htlc2 := e1.Value.(*PaymentDescriptor), e2.Value.(*PaymentDescriptor)
+		htlc1, htlc2 := e1.Value, e2.Value
 		if err := compareHtlcs(htlc1, htlc2); err != nil {
 			return err
 		}
@@ -6773,7 +6818,7 @@ func compareIndexes(a, b map[uint64]*list.Element) error {
 			return fmt.Errorf("element with key %d not "+
 				"found in a", k1)
 		}
-		htlc1, htlc2 := e1.Value.(*PaymentDescriptor), e2.Value.(*PaymentDescriptor)
+		htlc1, htlc2 := e1.Value, e2.Value
 		if err := compareHtlcs(htlc1, htlc2); err != nil {
 			return err
 		}
@@ -6808,7 +6853,7 @@ func compareLogs(a, b *updateLog) error {
 
 	e1, e2 := a.Front(), b.Front()
 	for ; e1 != nil; e1, e2 = e1.Next(), e2.Next() {
-		htlc1, htlc2 := e1.Value.(*PaymentDescriptor), e2.Value.(*PaymentDescriptor)
+		htlc1, htlc2 := e1.Value, e2.Value
 		if err := compareHtlcs(htlc1, htlc2); err != nil {
 			return err
 		}
@@ -6895,20 +6940,20 @@ func TestChannelRestoreUpdateLogs(t *testing.T) {
 
 	// compare all the logs between the old and new channels, to make sure
 	// they all got restored properly.
-	err = compareLogs(aliceChannel.localUpdateLog,
-		newAliceChannel.localUpdateLog)
+	err = compareLogs(aliceChannel.updateLogs.Local,
+		newAliceChannel.updateLogs.Local)
 	require.NoError(t, err, "alice local log not restored")
 
-	err = compareLogs(aliceChannel.remoteUpdateLog,
-		newAliceChannel.remoteUpdateLog)
+	err = compareLogs(aliceChannel.updateLogs.Remote,
+		newAliceChannel.updateLogs.Remote)
 	require.NoError(t, err, "alice remote log not restored")
 
-	err = compareLogs(bobChannel.localUpdateLog,
-		newBobChannel.localUpdateLog)
+	err = compareLogs(bobChannel.updateLogs.Local,
+		newBobChannel.updateLogs.Local)
 	require.NoError(t, err, "bob local log not restored")
 
-	err = compareLogs(bobChannel.remoteUpdateLog,
-		newBobChannel.remoteUpdateLog)
+	err = compareLogs(bobChannel.updateLogs.Remote,
+		newBobChannel.updateLogs.Remote)
 	require.NoError(t, err, "bob remote log not restored")
 }
 
@@ -6916,7 +6961,7 @@ func TestChannelRestoreUpdateLogs(t *testing.T) {
 func fetchNumUpdates(t updateType, log *updateLog) int {
 	num := 0
 	for e := log.Front(); e != nil; e = e.Next() {
-		htlc := e.Value.(*PaymentDescriptor)
+		htlc := e.Value
 		if htlc.EntryType == t {
 			num++
 		}
@@ -6941,8 +6986,9 @@ func assertInLog(t *testing.T, log *updateLog, numAdds, numFails int) {
 // the local and remote update log of the given channel.
 func assertInLogs(t *testing.T, channel *LightningChannel, numAddsLocal,
 	numFailsLocal, numAddsRemote, numFailsRemote int) {
-	assertInLog(t, channel.localUpdateLog, numAddsLocal, numFailsLocal)
-	assertInLog(t, channel.remoteUpdateLog, numAddsRemote, numFailsRemote)
+
+	assertInLog(t, channel.updateLogs.Local, numAddsLocal, numFailsLocal)
+	assertInLog(t, channel.updateLogs.Remote, numAddsRemote, numFailsRemote)
 }
 
 // restoreAndAssert creates a new LightningChannel from the given channel's
@@ -6957,8 +7003,10 @@ func restoreAndAssert(t *testing.T, channel *LightningChannel, numAddsLocal,
 	)
 	require.NoError(t, err, "unable to create new channel")
 
-	assertInLog(t, newChannel.localUpdateLog, numAddsLocal, numFailsLocal)
-	assertInLog(t, newChannel.remoteUpdateLog, numAddsRemote, numFailsRemote)
+	assertInLog(t, newChannel.updateLogs.Local, numAddsLocal, numFailsLocal)
+	assertInLog(
+		t, newChannel.updateLogs.Remote, numAddsRemote, numFailsRemote,
+	)
 }
 
 // TestChannelRestoreUpdateLogsFailedHTLC runs through a scenario where an
@@ -7222,16 +7270,18 @@ func TestChannelRestoreCommitHeight(t *testing.T) {
 
 		var pd *PaymentDescriptor
 		if remoteLog {
-			if newChannel.localUpdateLog.lookupHtlc(htlcIndex) != nil {
+			h := newChannel.updateLogs.Local.lookupHtlc(htlcIndex)
+			if h != nil {
 				t.Fatalf("htlc found in wrong log")
 			}
-			pd = newChannel.remoteUpdateLog.lookupHtlc(htlcIndex)
+			pd = newChannel.updateLogs.Remote.lookupHtlc(htlcIndex)
 
 		} else {
-			if newChannel.remoteUpdateLog.lookupHtlc(htlcIndex) != nil {
+			h := newChannel.updateLogs.Remote.lookupHtlc(htlcIndex)
+			if h != nil {
 				t.Fatalf("htlc found in wrong log")
 			}
-			pd = newChannel.localUpdateLog.lookupHtlc(htlcIndex)
+			pd = newChannel.updateLogs.Local.lookupHtlc(htlcIndex)
 		}
 		if pd == nil {
 			t.Fatalf("htlc not found in log")
@@ -7502,7 +7552,7 @@ func TestForceCloseBorkedState(t *testing.T) {
 
 	// We manually advance the commitment tail here since the above
 	// ReceiveRevocation call will fail before it's actually advanced.
-	aliceChannel.remoteCommitChain.advanceTail()
+	aliceChannel.commitChains.Remote.advanceTail()
 	_, err = aliceChannel.SignNextCommitment()
 	if err != channeldb.ErrChanBorked {
 		t.Fatalf("sign commitment should have failed: %v", err)
@@ -7718,7 +7768,7 @@ func TestIdealCommitFeeRate(t *testing.T) {
 		maxFeeAlloc float64) chainfee.SatPerKWeight {
 
 		balance, weight := c.availableBalance(AdditionalHtlc)
-		feeRate := c.localCommitChain.tip().feePerKw
+		feeRate := c.commitChains.Local.tip().feePerKw
 		currentFee := feeRate.FeeForWeight(weight)
 
 		maxBalance := balance.ToSatoshis() + currentFee
@@ -7735,7 +7785,7 @@ func TestIdealCommitFeeRate(t *testing.T) {
 	// currentFeeRate calculates the current fee rate of the channel. The
 	// ideal fee rate is floored at the current fee rate of the channel.
 	currentFeeRate := func(c *LightningChannel) chainfee.SatPerKWeight {
-		return c.localCommitChain.tip().feePerKw
+		return c.commitChains.Local.tip().feePerKw
 	}
 
 	// testCase definies the test cases when calculating the ideal fee rate
@@ -7984,11 +8034,11 @@ func TestChannelFeeRateFloor(t *testing.T) {
 // TestFetchParent tests lookup of an entry's parent in the appropriate log.
 func TestFetchParent(t *testing.T) {
 	tests := []struct {
-		name          string
-		remoteChain   bool
-		remoteLog     bool
-		localEntries  []*PaymentDescriptor
-		remoteEntries []*PaymentDescriptor
+		name             string
+		whoseCommitChain lntypes.ChannelParty
+		whoseUpdateLog   lntypes.ChannelParty
+		localEntries     []*PaymentDescriptor
+		remoteEntries    []*PaymentDescriptor
 
 		// parentIndex is the parent index of the entry that we will
 		// lookup with fetch parent.
@@ -8002,22 +8052,22 @@ func TestFetchParent(t *testing.T) {
 		expectedIndex uint64
 	}{
 		{
-			name:          "not found in remote log",
-			localEntries:  nil,
-			remoteEntries: nil,
-			remoteChain:   true,
-			remoteLog:     true,
-			parentIndex:   0,
-			expectErr:     true,
+			name:             "not found in remote log",
+			localEntries:     nil,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      0,
+			expectErr:        true,
 		},
 		{
-			name:          "not found in local log",
-			localEntries:  nil,
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   0,
-			expectErr:     true,
+			name:             "not found in local log",
+			localEntries:     nil,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      0,
+			expectErr:        true,
 		},
 		{
 			name:         "remote log + chain, remote add height 0",
@@ -8037,10 +8087,10 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 0,
 				},
 			},
-			remoteChain: true,
-			remoteLog:   true,
-			parentIndex: 1,
-			expectErr:   true,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name: "remote log, local chain, local add height 0",
@@ -8059,11 +8109,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			localEntries: nil,
-			remoteChain:  false,
-			remoteLog:    true,
-			parentIndex:  1,
-			expectErr:    true,
+			localEntries:     nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name: "local log + chain, local add height 0",
@@ -8082,11 +8132,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     true,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 
 		{
@@ -8106,11 +8156,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 0,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   true,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     true,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        true,
 		},
 		{
 			name:         "remote log found",
@@ -8130,11 +8180,11 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteChain:   true,
-			remoteLog:     true,
-			parentIndex:   1,
-			expectErr:     false,
-			expectedIndex: 2,
+			whoseCommitChain: lntypes.Remote,
+			whoseUpdateLog:   lntypes.Remote,
+			parentIndex:      1,
+			expectErr:        false,
+			expectedIndex:    2,
 		},
 		{
 			name: "local log found",
@@ -8153,12 +8203,12 @@ func TestFetchParent(t *testing.T) {
 					addCommitHeightRemote: 100,
 				},
 			},
-			remoteEntries: nil,
-			remoteChain:   false,
-			remoteLog:     false,
-			parentIndex:   1,
-			expectErr:     false,
-			expectedIndex: 2,
+			remoteEntries:    nil,
+			whoseCommitChain: lntypes.Local,
+			whoseUpdateLog:   lntypes.Local,
+			parentIndex:      1,
+			expectErr:        false,
+			expectedIndex:    2,
 		},
 	}
 
@@ -8169,24 +8219,26 @@ func TestFetchParent(t *testing.T) {
 			// Create a lightning channel with newly initialized
 			// local and remote logs.
 			lc := LightningChannel{
-				localUpdateLog:  newUpdateLog(0, 0),
-				remoteUpdateLog: newUpdateLog(0, 0),
+				updateLogs: lntypes.Dual[*updateLog]{
+					Local:  newUpdateLog(0, 0),
+					Remote: newUpdateLog(0, 0),
+				},
 			}
 
 			// Add the local and remote entries to update logs.
 			for _, entry := range test.localEntries {
-				lc.localUpdateLog.appendHtlc(entry)
+				lc.updateLogs.Local.appendHtlc(entry)
 			}
 			for _, entry := range test.remoteEntries {
-				lc.remoteUpdateLog.appendHtlc(entry)
+				lc.updateLogs.Remote.appendHtlc(entry)
 			}
 
 			parent, err := lc.fetchParent(
 				&PaymentDescriptor{
 					ParentIndex: test.parentIndex,
 				},
-				test.remoteChain,
-				test.remoteLog,
+				test.whoseCommitChain,
+				test.whoseUpdateLog,
 			)
 			gotErr := err != nil
 			if test.expectErr != gotErr {
@@ -8244,11 +8296,11 @@ func TestEvaluateView(t *testing.T) {
 	)
 
 	tests := []struct {
-		name        string
-		ourHtlcs    []*PaymentDescriptor
-		theirHtlcs  []*PaymentDescriptor
-		remoteChain bool
-		mutateState bool
+		name             string
+		ourHtlcs         []*PaymentDescriptor
+		theirHtlcs       []*PaymentDescriptor
+		whoseCommitChain lntypes.ChannelParty
+		mutateState      bool
 
 		// ourExpectedHtlcs is the set of our htlcs that we expect in
 		// the htlc view once it has been evaluated. We just store
@@ -8275,9 +8327,9 @@ func TestEvaluateView(t *testing.T) {
 		expectSent lnwire.MilliSatoshi
 	}{
 		{
-			name:        "our fee update is applied",
-			remoteChain: false,
-			mutateState: false,
+			name:             "our fee update is applied",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					Amount:    ourFeeUpdateAmt,
@@ -8292,10 +8344,10 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:         0,
 		},
 		{
-			name:        "their fee update is applied",
-			remoteChain: false,
-			mutateState: false,
-			ourHtlcs:    []*PaymentDescriptor{},
+			name:             "their fee update is applied",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
+			ourHtlcs:         []*PaymentDescriptor{},
 			theirHtlcs: []*PaymentDescriptor{
 				{
 					Amount:    theirFeeUpdateAmt,
@@ -8310,9 +8362,9 @@ func TestEvaluateView(t *testing.T) {
 		},
 		{
 			// We expect unresolved htlcs to to remain in the view.
-			name:        "htlcs adds without settles",
-			remoteChain: false,
-			mutateState: false,
+			name:             "htlcs adds without settles",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8344,9 +8396,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "our htlc settled, state mutated",
-			remoteChain: false,
-			mutateState: true,
+			name:             "our htlc settled, state mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      true,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex:            0,
@@ -8379,9 +8431,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     htlcAddAmount,
 		},
 		{
-			name:        "our htlc settled, state not mutated",
-			remoteChain: false,
-			mutateState: false,
+			name:             "our htlc settled, state not mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex:            0,
@@ -8414,9 +8466,9 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "their htlc settled, state mutated",
-			remoteChain: false,
-			mutateState: true,
+			name:             "their htlc settled, state mutated",
+			whoseCommitChain: lntypes.Local,
+			mutateState:      true,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8457,9 +8509,10 @@ func TestEvaluateView(t *testing.T) {
 			expectSent:     0,
 		},
 		{
-			name:        "their htlc settled, state not mutated",
-			remoteChain: false,
-			mutateState: false,
+			name: "their htlc settled, state not mutated",
+
+			whoseCommitChain: lntypes.Local,
+			mutateState:      false,
 			ourHtlcs: []*PaymentDescriptor{
 				{
 					HtlcIndex: 0,
@@ -8504,30 +8557,32 @@ func TestEvaluateView(t *testing.T) {
 				},
 
 				// Create update logs for local and remote.
-				localUpdateLog:  newUpdateLog(0, 0),
-				remoteUpdateLog: newUpdateLog(0, 0),
+				updateLogs: lntypes.Dual[*updateLog]{
+					Local:  newUpdateLog(0, 0),
+					Remote: newUpdateLog(0, 0),
+				},
 			}
 
 			for _, htlc := range test.ourHtlcs {
 				if htlc.EntryType == Add {
-					lc.localUpdateLog.appendHtlc(htlc)
+					lc.updateLogs.Local.appendHtlc(htlc)
 				} else {
-					lc.localUpdateLog.appendUpdate(htlc)
+					lc.updateLogs.Local.appendUpdate(htlc)
 				}
 			}
 
 			for _, htlc := range test.theirHtlcs {
 				if htlc.EntryType == Add {
-					lc.remoteUpdateLog.appendHtlc(htlc)
+					lc.updateLogs.Remote.appendHtlc(htlc)
 				} else {
-					lc.remoteUpdateLog.appendUpdate(htlc)
+					lc.updateLogs.Remote.appendUpdate(htlc)
 				}
 			}
 
-			view := &htlcView{
-				ourUpdates:   test.ourHtlcs,
-				theirUpdates: test.theirHtlcs,
-				feePerKw:     feePerKw,
+			view := &HtlcView{
+				OurUpdates:   test.ourHtlcs,
+				TheirUpdates: test.theirHtlcs,
+				FeePerKw:     feePerKw,
 			}
 
 			var (
@@ -8542,23 +8597,23 @@ func TestEvaluateView(t *testing.T) {
 			// Evaluate the htlc view, mutate as test expects.
 			result, err := lc.evaluateHTLCView(
 				view, &ourBalance, &theirBalance, nextHeight,
-				test.remoteChain, test.mutateState,
+				test.whoseCommitChain, test.mutateState,
 			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if result.feePerKw != test.expectedFee {
+			if result.FeePerKw != test.expectedFee {
 				t.Fatalf("expected fee: %v, got: %v",
-					test.expectedFee, result.feePerKw)
+					test.expectedFee, result.FeePerKw)
 			}
 
 			checkExpectedHtlcs(
-				t, result.ourUpdates, test.ourExpectedHtlcs,
+				t, result.OurUpdates, test.ourExpectedHtlcs,
 			)
 
 			checkExpectedHtlcs(
-				t, result.theirUpdates, test.theirExpectedHtlcs,
+				t, result.TheirUpdates, test.theirExpectedHtlcs,
 			)
 
 			if lc.channelState.TotalMSatSent != test.expectSent {
@@ -8630,12 +8685,12 @@ func TestProcessFeeUpdate(t *testing.T) {
 	)
 
 	tests := []struct {
-		name            string
-		startHeights    heights
-		expectedHeights heights
-		remoteChain     bool
-		mutate          bool
-		expectedFee     chainfee.SatPerKWeight
+		name             string
+		startHeights     heights
+		expectedHeights  heights
+		whoseCommitChain lntypes.ChannelParty
+		mutate           bool
+		expectedFee      chainfee.SatPerKWeight
 	}{
 		{
 			// Looking at local chain, local add is non-zero so
@@ -8653,9 +8708,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: height,
 			},
-			remoteChain: false,
-			mutate:      false,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Local,
+			mutate:           false,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Looking at local chain, local add is zero so the
@@ -8674,9 +8729,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    height,
 				remoteRemove: 0,
 			},
-			remoteChain: false,
-			mutate:      false,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Local,
+			mutate:           false,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 		{
 			// Looking at remote chain, the remote add height is
@@ -8695,9 +8750,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: 0,
 			},
-			remoteChain: true,
-			mutate:      false,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Remote,
+			mutate:           false,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 		{
 			// Looking at remote chain, the remote add height is
@@ -8716,9 +8771,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    height,
 				remoteRemove: 0,
 			},
-			remoteChain: true,
-			mutate:      false,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Remote,
+			mutate:           false,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Local add height is non-zero, so the update has
@@ -8737,9 +8792,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: height,
 			},
-			remoteChain: false,
-			mutate:      true,
-			expectedFee: feePerKw,
+			whoseCommitChain: lntypes.Local,
+			mutate:           true,
+			expectedFee:      feePerKw,
 		},
 		{
 			// Local add is zero and we are looking at our local
@@ -8759,9 +8814,9 @@ func TestProcessFeeUpdate(t *testing.T) {
 				remoteAdd:    0,
 				remoteRemove: 0,
 			},
-			remoteChain: false,
-			mutate:      true,
-			expectedFee: ourFeeUpdatePerSat,
+			whoseCommitChain: lntypes.Local,
+			mutate:           true,
+			expectedFee:      ourFeeUpdatePerSat,
 		},
 	}
 
@@ -8781,15 +8836,15 @@ func TestProcessFeeUpdate(t *testing.T) {
 				EntryType:                FeeUpdate,
 			}
 
-			view := &htlcView{
-				feePerKw: chainfee.SatPerKWeight(feePerKw),
+			view := &HtlcView{
+				FeePerKw: chainfee.SatPerKWeight(feePerKw),
 			}
 			processFeeUpdate(
-				update, nextHeight, test.remoteChain,
+				update, nextHeight, test.whoseCommitChain,
 				test.mutate, view,
 			)
 
-			if view.feePerKw != test.expectedFee {
+			if view.FeePerKw != test.expectedFee {
 				t.Fatalf("expected fee: %v, got: %v",
 					test.expectedFee, feePerKw)
 			}
@@ -8840,7 +8895,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 	tests := []struct {
 		name                 string
 		startHeights         heights
-		remoteChain          bool
+		whoseCommitChain     lntypes.ChannelParty
 		isIncoming           bool
 		mutateState          bool
 		ourExpectedBalance   lnwire.MilliSatoshi
@@ -8856,7 +8911,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8877,7 +8932,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8898,7 +8953,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -8919,7 +8974,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance,
@@ -8941,7 +8996,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance - updateAmount,
@@ -8962,7 +9017,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance - updateAmount,
@@ -8983,7 +9038,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: removeHeight,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -9004,7 +9059,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  removeHeight,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -9027,7 +9082,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -9050,7 +9105,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -9073,7 +9128,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance,
@@ -9096,7 +9151,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           false,
 			mutateState:          false,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -9121,7 +9176,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          false,
+			whoseCommitChain:     lntypes.Local,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -9146,7 +9201,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 				localRemove:  0,
 				remoteRemove: 0,
 			},
-			remoteChain:          true,
+			whoseCommitChain:     lntypes.Remote,
 			isIncoming:           true,
 			mutateState:          true,
 			ourExpectedBalance:   startBalance + updateAmount,
@@ -9195,7 +9250,7 @@ func TestProcessAddRemoveEntry(t *testing.T) {
 
 			process(
 				update, &ourBalance, &theirBalance, nextHeight,
-				test.remoteChain, test.isIncoming,
+				test.whoseCommitChain, test.isIncoming,
 				test.mutateState,
 			)
 
@@ -9750,9 +9805,13 @@ func testGetDustSum(t *testing.T, chantype channeldb.ChannelType) {
 	checkDust := func(c *LightningChannel, expLocal,
 		expRemote lnwire.MilliSatoshi) {
 
-		localDustSum := c.GetDustSum(false)
+		localDustSum := c.GetDustSum(
+			lntypes.Local, fn.None[chainfee.SatPerKWeight](),
+		)
 		require.Equal(t, expLocal, localDustSum)
-		remoteDustSum := c.GetDustSum(true)
+		remoteDustSum := c.GetDustSum(
+			lntypes.Remote, fn.None[chainfee.SatPerKWeight](),
+		)
 		require.Equal(t, expRemote, remoteDustSum)
 	}
 
@@ -9905,8 +9964,9 @@ func deriveDummyRetributionParams(chanState *channeldb.OpenChannel) (uint32,
 	config := chanState.RemoteChanCfg
 	commitHash := chanState.RemoteCommitment.CommitTx.TxHash()
 	keyRing := DeriveCommitmentKeys(
-		config.RevocationBasePoint.PubKey, false, chanState.ChanType,
-		&chanState.LocalChanCfg, &chanState.RemoteChanCfg,
+		config.RevocationBasePoint.PubKey, lntypes.Remote,
+		chanState.ChanType, &chanState.LocalChanCfg,
+		&chanState.RemoteChanCfg,
 	)
 	leaseExpiry := chanState.ThawHeight
 	return leaseExpiry, keyRing, commitHash
@@ -9934,15 +9994,17 @@ func TestCreateHtlcRetribution(t *testing.T) {
 		aliceChannel.channelState,
 	)
 	htlc := &channeldb.HTLCEntry{
-		Amt:         testAmt,
-		Incoming:    true,
-		OutputIndex: 1,
+		Amt: tlv.NewRecordT[tlv.TlvType4](
+			tlv.NewBigSizeT(testAmt),
+		),
+		Incoming:    tlv.NewPrimitiveRecord[tlv.TlvType3](true),
+		OutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType2, uint16](1),
 	}
 
 	// Create the htlc retribution.
 	hr, err := createHtlcRetribution(
 		aliceChannel.channelState, keyRing, commitHash,
-		dummyPrivate, leaseExpiry, htlc,
+		dummyPrivate, leaseExpiry, htlc, fn.None[CommitAuxLeaves](),
 	)
 	// Expect no error.
 	require.NoError(t, err)
@@ -9950,8 +10012,8 @@ func TestCreateHtlcRetribution(t *testing.T) {
 	// Check the fields have expected values.
 	require.EqualValues(t, testAmt, hr.SignDesc.Output.Value)
 	require.Equal(t, commitHash, hr.OutPoint.Hash)
-	require.EqualValues(t, htlc.OutputIndex, hr.OutPoint.Index)
-	require.Equal(t, htlc.Incoming, hr.IsIncoming)
+	require.EqualValues(t, htlc.OutputIndex.Val, hr.OutPoint.Index)
+	require.Equal(t, htlc.Incoming.Val, hr.IsIncoming)
 }
 
 // TestCreateBreachRetribution checks that `createBreachRetribution` behaves as
@@ -9991,30 +10053,31 @@ func TestCreateBreachRetribution(t *testing.T) {
 		aliceChannel.channelState,
 	)
 	htlc := &channeldb.HTLCEntry{
-		Amt:         btcutil.Amount(testAmt),
-		Incoming:    true,
-		OutputIndex: uint16(htlcIndex),
+		Amt: tlv.NewRecordT[tlv.TlvType4](
+			tlv.NewBigSizeT(btcutil.Amount(testAmt)),
+		),
+		Incoming: tlv.NewPrimitiveRecord[tlv.TlvType3](true),
+		OutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType2](
+			uint16(htlcIndex),
+		),
 	}
 
 	// Create a dummy revocation log.
 	ourAmtMsat := lnwire.MilliSatoshi(ourAmt * 1000)
 	theirAmtMsat := lnwire.MilliSatoshi(theirAmt * 1000)
-	revokedLog := channeldb.RevocationLog{
-		CommitTxHash:     commitHash,
-		OurOutputIndex:   uint16(localIndex),
-		TheirOutputIndex: uint16(remoteIndex),
-		HTLCEntries:      []*channeldb.HTLCEntry{htlc},
-		TheirBalance:     &theirAmtMsat,
-		OurBalance:       &ourAmtMsat,
-	}
+	revokedLog := channeldb.NewRevocationLog(
+		uint16(localIndex), uint16(remoteIndex), commitHash,
+		fn.Some(ourAmtMsat), fn.Some(theirAmtMsat),
+		[]*channeldb.HTLCEntry{htlc}, fn.None[tlv.Blob](),
+	)
 
 	// Create a log with an empty local output index.
 	revokedLogNoLocal := revokedLog
-	revokedLogNoLocal.OurOutputIndex = channeldb.OutputIndexEmpty
+	revokedLogNoLocal.OurOutputIndex.Val = channeldb.OutputIndexEmpty
 
 	// Create a log with an empty remote output index.
 	revokedLogNoRemote := revokedLog
-	revokedLogNoRemote.TheirOutputIndex = channeldb.OutputIndexEmpty
+	revokedLogNoRemote.TheirOutputIndex.Val = channeldb.OutputIndexEmpty
 
 	testCases := []struct {
 		name             string
@@ -10044,14 +10107,20 @@ func TestCreateBreachRetribution(t *testing.T) {
 		{
 			name: "fail due to our index too big",
 			revocationLog: &channeldb.RevocationLog{
-				OurOutputIndex: uint16(htlcIndex + 1),
+				//nolint:lll
+				OurOutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType0](
+					uint16(htlcIndex + 1),
+				),
 			},
 			expectedErr: ErrOutputIndexOutOfRange,
 		},
 		{
 			name: "fail due to their index too big",
 			revocationLog: &channeldb.RevocationLog{
-				TheirOutputIndex: uint16(htlcIndex + 1),
+				//nolint:lll
+				TheirOutputIndex: tlv.NewPrimitiveRecord[tlv.TlvType1](
+					uint16(htlcIndex + 1),
+				),
 			},
 			expectedErr: ErrOutputIndexOutOfRange,
 		},
@@ -10120,11 +10189,12 @@ func TestCreateBreachRetribution(t *testing.T) {
 		require.Equal(t, remote, br.RemoteOutpoint)
 
 		for _, hr := range br.HtlcRetributions {
-			require.EqualValues(t, testAmt,
-				hr.SignDesc.Output.Value)
+			require.EqualValues(
+				t, testAmt, hr.SignDesc.Output.Value,
+			)
 			require.Equal(t, commitHash, hr.OutPoint.Hash)
 			require.EqualValues(t, htlcIndex, hr.OutPoint.Index)
-			require.Equal(t, htlc.Incoming, hr.IsIncoming)
+			require.Equal(t, htlc.Incoming.Val, hr.IsIncoming)
 		}
 	}
 
@@ -10140,6 +10210,7 @@ func TestCreateBreachRetribution(t *testing.T) {
 				tc.revocationLog, tx,
 				aliceChannel.channelState, keyRing,
 				dummyPrivate, leaseExpiry,
+				fn.None[CommitAuxLeaves](),
 			)
 
 			// Check the error if expected.
@@ -10258,6 +10329,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// error as there are no past delta state saved as revocation logs yet.
 	_, err = NewBreachRetribution(
 		aliceChannel.channelState, stateNum, breachHeight, breachTx,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.ErrorIs(t, err, channeldb.ErrNoPastDeltas)
 
@@ -10265,6 +10337,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// provided.
 	_, err = NewBreachRetribution(
 		aliceChannel.channelState, stateNum, breachHeight, nil,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.ErrorIs(t, err, channeldb.ErrNoPastDeltas)
 
@@ -10310,6 +10383,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// successfully.
 	br, err := NewBreachRetribution(
 		aliceChannel.channelState, stateNum, breachHeight, breachTx,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err)
 
@@ -10321,6 +10395,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// since the necessary info should now be found in the revocation log.
 	br, err = NewBreachRetribution(
 		aliceChannel.channelState, stateNum, breachHeight, nil,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.NoError(t, err)
 	assertRetribution(br, 1, 0)
@@ -10329,6 +10404,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// error.
 	_, err = NewBreachRetribution(
 		aliceChannel.channelState, stateNum+1, breachHeight, breachTx,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.ErrorIs(t, err, channeldb.ErrLogEntryNotFound)
 
@@ -10336,6 +10412,7 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 	// provided.
 	_, err = NewBreachRetribution(
 		aliceChannel.channelState, stateNum+1, breachHeight, nil,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
 	)
 	require.ErrorIs(t, err, channeldb.ErrLogEntryNotFound)
 }
@@ -10373,7 +10450,8 @@ func TestExtractPayDescs(t *testing.T) {
 	// NOTE: we use nil commitment key rings to avoid checking the htlc
 	// scripts(`genHtlcScript`) as it should be tested independently.
 	incomingPDs, outgoingPDs, err := lnChan.extractPayDescs(
-		0, 0, htlcs, nil, nil, true,
+		0, htlcs, lntypes.Dual[*CommitmentKeyRing]{}, lntypes.Local,
+		fn.None[CommitAuxLeaves](),
 	)
 	require.NoError(t, err)
 
@@ -10409,19 +10487,26 @@ func assertPayDescMatchHTLC(t *testing.T, pd PaymentDescriptor,
 // the `Incoming`.
 func createRandomHTLC(t *testing.T, incoming bool) channeldb.HTLC {
 	var onionBlob [lnwire.OnionPacketSize]byte
-	_, err := rand.Read(onionBlob[:])
+	_, err := crand.Read(onionBlob[:])
 	require.NoError(t, err)
 
 	var rHash [lntypes.HashSize]byte
-	_, err = rand.Read(rHash[:])
+	_, err = crand.Read(rHash[:])
 	require.NoError(t, err)
 
 	sig := make([]byte, 64)
-	_, err = rand.Read(sig)
+	_, err = crand.Read(sig)
 	require.NoError(t, err)
 
+	randCustomData := make([]byte, 32)
+	_, err = crand.Read(randCustomData)
+	require.NoError(t, err)
+
+	randCustomType := rand.Intn(255) + lnwire.MinCustomRecordsTlvType
+
 	blinding, err := pubkeyFromHex(
-		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48236c39", //nolint:lll
+		"0228f2af0abe322403480fb3ee172f7f1601e67d1da6cad40b54c4468d48" +
+			"236c39",
 	)
 	require.NoError(t, err)
 
@@ -10436,9 +10521,13 @@ func createRandomHTLC(t *testing.T, incoming bool) channeldb.HTLC {
 		HtlcIndex:     rand.Uint64(),
 		LogIndex:      rand.Uint64(),
 		BlindingPoint: tlv.SomeRecordT(
-			//nolint:lll
-			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](blinding),
+			tlv.NewPrimitiveRecord[lnwire.BlindingPointTlvType](
+				blinding,
+			),
 		),
+		CustomRecords: map[uint64][]byte{
+			uint64(randCustomType): randCustomData,
+		},
 	}
 }
 
@@ -11043,7 +11132,7 @@ func TestBlindingPointPersistence(t *testing.T) {
 	require.NoError(t, err, "unable to restart alice")
 
 	// Assert that the blinding point is restored from disk.
-	remoteCommit := aliceChannel.remoteCommitChain.tip()
+	remoteCommit := aliceChannel.commitChains.Remote.tip()
 	require.Len(t, remoteCommit.outgoingHTLCs, 1)
 	require.Equal(t, blinding,
 		remoteCommit.outgoingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
@@ -11060,7 +11149,7 @@ func TestBlindingPointPersistence(t *testing.T) {
 	require.NoError(t, err, "unable to restart bob's channel")
 
 	// Assert that Bob is able to recover the blinding point from disk.
-	bobCommit := bobChannel.localCommitChain.tip()
+	bobCommit := bobChannel.commitChains.Local.tip()
 	require.Len(t, bobCommit.incomingHTLCs, 1)
 	require.Equal(t, blinding,
 		bobCommit.incomingHTLCs[0].BlindingPoint.UnwrapOrFailV(t))
