@@ -6,6 +6,7 @@ import (
 
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/tlv"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -144,10 +145,8 @@ func TestCustomRecordsExtendRecordProducers(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			nonCustomRecords := tlv.MapToRecords(tc.existingTypes)
-			nonCustomProducers := fn.Map(
-				func(r tlv.Record) tlv.RecordProducer {
-					return &recordProducer{r}
-				}, nonCustomRecords,
+			nonCustomProducers := RecordsAsProducers(
+				nonCustomRecords,
 			)
 
 			combined, err := tc.customRecords.ExtendRecordProducers(
@@ -195,4 +194,55 @@ func serializeRecordProducers(t *testing.T,
 	require.NoError(t, err)
 
 	return b.Bytes()
+}
+
+func TestCustomRecordsMergedCopy(t *testing.T) {
+	tests := []struct {
+		name  string
+		c     CustomRecords
+		other CustomRecords
+		want  CustomRecords
+	}{
+		{
+			name: "nil records",
+			want: make(CustomRecords),
+		},
+		{
+			name:  "empty records",
+			c:     make(CustomRecords),
+			other: make(CustomRecords),
+			want:  make(CustomRecords),
+		},
+		{
+			name: "distinct records",
+			c: CustomRecords{
+				1: {1, 2, 3},
+			},
+			other: CustomRecords{
+				2: {4, 5, 6},
+			},
+			want: CustomRecords{
+				1: {1, 2, 3},
+				2: {4, 5, 6},
+			},
+		},
+		{
+			name: "same records, different values",
+			c: CustomRecords{
+				1: {1, 2, 3},
+			},
+			other: CustomRecords{
+				1: {4, 5, 6},
+			},
+			want: CustomRecords{
+				1: {4, 5, 6},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.c.MergedCopy(tt.other)
+			assert.Equal(t, tt.want, result)
+		})
+	}
 }

@@ -366,7 +366,7 @@ func testVectors(t *testing.T, chanType channeldb.ChannelType, test testCase) {
 	revMsg, _, _, err := remoteChannel.RevokeCurrentCommitment()
 	require.NoError(t, err)
 
-	_, _, _, _, err = localChannel.ReceiveRevocation(revMsg)
+	_, _, err = localChannel.ReceiveRevocation(revMsg)
 	require.NoError(t, err)
 
 	remoteNewCommit, err := remoteChannel.SignNextCommitment()
@@ -1018,9 +1018,12 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 		tc.remotePaymentBasepointSecret, remoteDummy1, remoteDummy2,
 	}, nil)
 
+	auxSigner := NewDefaultAuxSignerMock(t)
 	remotePool := NewSigPool(1, remoteSigner)
 	channelRemote, err := NewLightningChannel(
 		remoteSigner, remoteChannelState, remotePool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	require.NoError(t, err)
 	require.NoError(t, remotePool.Start())
@@ -1028,6 +1031,8 @@ func createTestChannelsForVectors(tc *testContext, chanType channeldb.ChannelTyp
 	localPool := NewSigPool(1, localSigner)
 	channelLocal, err := NewLightningChannel(
 		localSigner, localChannelState, localPool,
+		WithLeafStore(&MockAuxLeafStore{}),
+		WithAuxSigner(auxSigner),
 	)
 	require.NoError(t, err)
 	require.NoError(t, localPool.Start())

@@ -36,6 +36,8 @@
 # Improvements
 ## Functional Updates
 
+* [Allow](https://github.com/lightningnetwork/lnd/pull/9017) the compression of logs during rotation with ZSTD via the `logcompressor` startup argument.
+
 ## RPC Updates
 
 ## lncli Updates
@@ -45,8 +47,13 @@
 ## Breaking Changes
 ## Performance Improvements
 
+* Log rotation can now use ZSTD 
+
 # Technical and Architectural Updates
 ## BOLT Spec Updates
+
+* Add new [lnwire](https://github.com/lightningnetwork/lnd/pull/8044) messages
+  for the Gossip 1.75 protocol.
 
 ## Testing
 ## Database
@@ -55,7 +62,12 @@
 
 ## Tooling and Documentation
 
+* [Improved `lncli create` command help text](https://github.com/lightningnetwork/lnd/pull/9077)
+  by replacing the word `argument` with `input` in the command description,
+  clarifying that the command requires interactive inputs rather than arguments.
+
 # Contributors (Alphabetical Order)
 
+* CharlieZKSmith
 * Pins
 * Ziggie

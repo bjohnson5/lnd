@@ -35,6 +35,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 func isAlias(scid lnwire.ShortChannelID) bool {
@@ -166,7 +167,7 @@ type mockServer struct {
 var _ lnpeer.Peer = (*mockServer)(nil)
 
 func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) {
-	signAliasUpdate := func(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+	signAliasUpdate := func(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 		error) {
 
 		return testSig, nil
@@ -182,9 +183,9 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 			events: make(map[time.Time]channeldb.ForwardingEvent),
 		},
 		FetchLastChannelUpdate: func(scid lnwire.ShortChannelID) (
-			*lnwire.ChannelUpdate, error) {
+			*lnwire.ChannelUpdate1, error) {
 
-			return &lnwire.ChannelUpdate{
+			return &lnwire.ChannelUpdate1{
 				ShortChannelID: scid,
 			}, nil
 		},
@@ -734,7 +735,7 @@ type mockChannelLink struct {
 	checkHtlcForwardResult *LinkError
 
 	failAliasUpdate func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate
+		incoming bool) *lnwire.ChannelUpdate1
 
 	confirmedZC bool
 }
@@ -869,7 +870,7 @@ func (f *mockChannelLink) AttachMailBox(mailBox MailBox) {
 }
 
 func (f *mockChannelLink) attachFailAliasUpdate(closure func(
-	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate) {
+	sid lnwire.ShortChannelID, incoming bool) *lnwire.ChannelUpdate1) {
 
 	f.failAliasUpdate = closure
 }
@@ -950,6 +951,14 @@ func (f *mockChannelLink) OnCommitOnce(LinkDirection, func()) {
 	// TODO(proofofkeags): Implement
 }
 
+func (f *mockChannelLink) FundingCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (f *mockChannelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
 var _ ChannelLink = (*mockChannelLink)(nil)
 
 func newDB() (*channeldb.DB, func(), error) {
@@ -1005,6 +1014,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		panic(err)
 	}
 
+	modifierMock := &invoices.MockHtlcModifier{}
 	registry := invoices.NewRegistry(
 		cdb,
 		invoices.NewInvoiceExpiryWatcher(
@@ -1013,6 +1023,7 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		),
 		&invoices.RegistryConfig{
 			FinalCltvRejectDelta: 5,
+			HtlcInterceptor:      modifierMock,
 		},
 	)
 	registry.Start()
@@ -1038,11 +1049,12 @@ func (i *mockInvoiceRegistry) SettleHodlInvoice(
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
 	circuitKey models.CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
 	event, err := i.registry.NotifyExitHopHtlc(
-		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
-		payload,
+		rhash, amt, expiry, currentHeight, circuitKey,
+		hodlChan, wireCustomRecords, payload,
 	)
 	if err != nil {
 		return nil, err

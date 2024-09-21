@@ -8,9 +8,9 @@ import (
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
-	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
@@ -139,14 +139,16 @@ type PaymentSession interface {
 	// A noRouteError is returned if a non-critical error is encountered
 	// during path finding.
 	RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
-		activeShards, height uint32) (*route.Route, error)
+		activeShards, height uint32,
+		firstHopCustomRecords lnwire.CustomRecords) (*route.Route,
+		error)
 
 	// UpdateAdditionalEdge takes an additional channel edge policy
 	// (private channels) and applies the update from the message. Returns
 	// a boolean to indicate whether the update has been applied without
 	// error.
-	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate, pubKey *btcec.PublicKey,
-		policy *models.CachedEdgePolicy) bool
+	UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
+		pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool
 
 	// GetAdditionalEdgePolicy uses the public key and channel ID to query
 	// the ephemeral channel edge policy for additional edges. Returns a nil
@@ -243,7 +245,8 @@ func newPaymentSession(p *LightningPayment, selfNode route.Vertex,
 // NOTE: This function is safe for concurrent access.
 // NOTE: Part of the PaymentSession interface.
 func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
-	activeShards, height uint32) (*route.Route, error) {
+	activeShards, height uint32,
+	firstHopCustomRecords lnwire.CustomRecords) (*route.Route, error) {
 
 	if p.empty {
 		return nil, errEmptyPaySession
@@ -265,16 +268,17 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 	// to our destination, respecting the recommendations from
 	// MissionControl.
 	restrictions := &RestrictParams{
-		ProbabilitySource:  p.missionControl.GetProbability,
-		FeeLimit:           feeLimit,
-		OutgoingChannelIDs: p.payment.OutgoingChannelIDs,
-		LastHop:            p.payment.LastHop,
-		CltvLimit:          cltvLimit,
-		DestCustomRecords:  p.payment.DestCustomRecords,
-		DestFeatures:       p.payment.DestFeatures,
-		PaymentAddr:        p.payment.PaymentAddr,
-		Amp:                p.payment.amp,
-		Metadata:           p.payment.Metadata,
+		ProbabilitySource:     p.missionControl.GetProbability,
+		FeeLimit:              feeLimit,
+		OutgoingChannelIDs:    p.payment.OutgoingChannelIDs,
+		LastHop:               p.payment.LastHop,
+		CltvLimit:             cltvLimit,
+		DestCustomRecords:     p.payment.DestCustomRecords,
+		DestFeatures:          p.payment.DestFeatures,
+		PaymentAddr:           p.payment.PaymentAddr,
+		Amp:                   p.payment.amp,
+		Metadata:              p.payment.Metadata,
+		FirstHopCustomRecords: firstHopCustomRecords,
 	}
 
 	finalHtlcExpiry := int32(height) + int32(finalCltvDelta)
@@ -284,9 +288,9 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 	// client-side MTU that we'll attempt to respect at all times.
 	maxShardActive := p.payment.MaxShardAmt != nil
 	if maxShardActive && maxAmt > *p.payment.MaxShardAmt {
-		p.log.Debug("Clamping payment attempt from %v to %v due to "+
-			"max shard size of %v", maxAmt,
-			*p.payment.MaxShardAmt, maxAmt)
+		p.log.Debugf("Clamping payment attempt from %v to %v due to "+
+			"max shard size of %v", maxAmt, *p.payment.MaxShardAmt,
+			maxAmt)
 
 		maxAmt = *p.payment.MaxShardAmt
 	}
@@ -432,11 +436,11 @@ func (p *paymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 // validates the message signature and checks it's up to date, then applies the
 // updates to the supplied policy. It returns a boolean to indicate whether
 // there's an error when applying the updates.
-func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
+func (p *paymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
 	pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool {
 
 	// Validate the message signature.
-	if err := graph.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
+	if err := netann.VerifyChannelUpdateSignature(msg, pubKey); err != nil {
 		log.Errorf(
 			"Unable to validate channel update signature: %v", err,
 		)

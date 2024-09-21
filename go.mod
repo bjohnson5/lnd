@@ -28,7 +28,7 @@ require (
 	github.com/jackpal/go-nat-pmp v0.0.0-20170405195558-28a68d0c24ad
 	github.com/jedib0t/go-pretty/v6 v6.2.7
 	github.com/jessevdk/go-flags v1.4.0
-	github.com/jrick/logrotate v1.0.0
+	github.com/jrick/logrotate v1.1.2
 	github.com/kkdai/bstream v1.0.0
 	github.com/lightninglabs/neutrino v0.16.1-0.20240425105051-602843d34ffd
 	github.com/lightninglabs/neutrino/cache v1.1.2
@@ -39,12 +39,13 @@ require (
 	github.com/lightningnetwork/lnd/healthcheck v1.2.5
 	github.com/lightningnetwork/lnd/kvdb v1.4.10
 	github.com/lightningnetwork/lnd/queue v1.1.1
-	github.com/lightningnetwork/lnd/sqldb v1.0.3
+	github.com/lightningnetwork/lnd/sqldb v1.0.4
 	github.com/lightningnetwork/lnd/ticker v1.1.1
 	github.com/lightningnetwork/lnd/tlv v1.2.6
 	github.com/lightningnetwork/lnd/tor v1.1.2
 	github.com/ltcsuite/ltcd v0.0.0-20190101042124-f37f8bf35796
 	github.com/miekg/dns v1.1.43
+	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.11.1
 	github.com/stretchr/testify v1.9.0
 	github.com/tv42/zbase32 v0.0.0-20160707012821-501572607d02
@@ -118,6 +119,7 @@ require (
 	github.com/json-iterator/go v1.1.11 // indirect
 	github.com/juju/loggo v0.0.0-20210728185423-eebad3a902c4 // indirect
 	github.com/juju/testing v0.0.0-20220203020004-a0ff61f03494 // indirect
+	github.com/klauspost/compress v1.17.9
 	github.com/lib/pq v1.10.9 // indirect
 	github.com/lightninglabs/gozmq v0.0.0-20191113021534-d20a764486bf // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -134,7 +136,6 @@ require (
 	github.com/opencontainers/image-spec v1.0.2 // indirect
 	github.com/opencontainers/runc v1.1.12 // indirect
 	github.com/ory/dockertest/v3 v3.10.0 // indirect
-	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_model v0.2.0 // indirect
 	github.com/prometheus/common v0.26.0 // indirect

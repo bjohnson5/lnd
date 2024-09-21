@@ -164,6 +164,9 @@ func createTestCtxFromGraphInstanceAssumeValid(t *testing.T,
 		Clock:              clock.NewTestClock(time.Unix(1, 0)),
 		ApplyChannelUpdate: graphBuilder.ApplyChannelUpdate,
 		ClosedSCIDs:        mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](
+			&mockTrafficShaper{},
+		),
 	})
 	require.NoError(t, router.Start(), "unable to start router")
 
@@ -220,7 +223,7 @@ func createTestCtxFromFile(t *testing.T,
 // Add valid signature to channel update simulated as error received from the
 // network.
 func signErrChanUpdate(t *testing.T, key *btcec.PrivateKey,
-	errChanUpdate *lnwire.ChannelUpdate) {
+	errChanUpdate *lnwire.ChannelUpdate1) {
 
 	chanUpdateMsg, err := errChanUpdate.DataToSign()
 	require.NoError(t, err, "failed to retrieve data to sign")
@@ -485,7 +488,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	// Set up a channel update message with an invalid signature to be
 	// returned to the sender.
 	var invalidSignature lnwire.Sig
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		Signature:       invalidSignature,
 		FeeRate:         500,
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(1),
@@ -519,7 +522,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	// Send off the payment request to the router. The specified route
 	// should be attempted and the channel update should be received by
 	// graph and ignored because it is missing a valid signature.
-	_, err = ctx.router.SendToRoute(payment, rt)
+	_, err = ctx.router.SendToRoute(payment, rt, nil)
 	require.Error(t, err, "expected route to fail with channel update")
 
 	_, e1, e2, err = ctx.graph.FetchChannelEdgesByID(
@@ -539,7 +542,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	ctx.graphBuilder.setNextReject(false)
 
 	// Retry the payment using the same route as before.
-	_, err = ctx.router.SendToRoute(payment, rt)
+	_, err = ctx.router.SendToRoute(payment, rt, nil)
 	require.Error(t, err, "expected route to fail with channel update")
 
 	// This time a valid signature was supplied and the policy change should
@@ -590,7 +593,7 @@ func TestSendPaymentErrorRepeatedFeeInsufficient(t *testing.T) {
 	)
 	require.NoError(t, err, "unable to fetch chan id")
 
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(
 			songokuSophonChanID,
 		),
@@ -709,7 +712,7 @@ func TestSendPaymentErrorFeeInsufficientPrivateEdge(t *testing.T) {
 	// Prepare an error update for the private channel, with twice the
 	// original fee.
 	updatedFeeBaseMSat := feeBaseMSat * 2
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(privateChannelID),
 		Timestamp:      uint32(testTime.Add(time.Minute).Unix()),
 		BaseFee:        updatedFeeBaseMSat,
@@ -835,7 +838,7 @@ func TestSendPaymentPrivateEdgeUpdateFeeExceedsLimit(t *testing.T) {
 	// Prepare an error update for the private channel. The updated fee
 	// will exceeds the feeLimit.
 	updatedFeeBaseMSat := feeBaseMSat + uint32(feeLimit)
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(privateChannelID),
 		Timestamp:      uint32(testTime.Add(time.Minute).Unix()),
 		BaseFee:        updatedFeeBaseMSat,
@@ -936,7 +939,7 @@ func TestSendPaymentErrorNonFinalTimeLockErrors(t *testing.T) {
 	_, _, edgeUpdateToFail, err := ctx.graph.FetchChannelEdgesByID(chanID)
 	require.NoError(t, err, "unable to fetch chan id")
 
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(chanID),
 		Timestamp:       uint32(edgeUpdateToFail.LastUpdate.Unix()),
 		MessageFlags:    edgeUpdateToFail.MessageFlags,
@@ -1399,7 +1402,7 @@ func TestSendToRouteStructuredError(t *testing.T) {
 	testCases := map[int]lnwire.FailureMessage{
 		finalHopIndex: lnwire.NewFailIncorrectDetails(payAmt, 100),
 		1: &lnwire.FailFeeInsufficient{
-			Update: lnwire.ChannelUpdate{},
+			Update: lnwire.ChannelUpdate1{},
 		},
 	}
 
@@ -1428,7 +1431,7 @@ func TestSendToRouteStructuredError(t *testing.T) {
 			// update should be received by router and ignored
 			// because it is missing a valid
 			// signature.
-			_, err = ctx.router.SendToRoute(payment, rt)
+			_, err = ctx.router.SendToRoute(payment, rt, nil)
 
 			fErr, ok := err.(*htlcswitch.ForwardingError)
 			require.True(
@@ -1507,7 +1510,7 @@ func TestSendToRouteMaxHops(t *testing.T) {
 	// Send off the payment request to the router. We expect an error back
 	// indicating that the route is too long.
 	var payHash lntypes.Hash
-	_, err = ctx.router.SendToRoute(payHash, rt)
+	_, err = ctx.router.SendToRoute(payHash, rt, nil)
 	if err != route.ErrMaxRouteHopsExceeded {
 		t.Fatalf("expected ErrMaxRouteHopsExceeded, but got %v", err)
 	}
@@ -1649,12 +1652,16 @@ func TestBuildRoute(t *testing.T) {
 
 	// Test that we can't build a route when no hops are given.
 	hops = []route.Vertex{}
-	_, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, nil)
+	_, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, nil, fn.None[[]byte](),
+	)
 	require.Error(t, err)
 
 	// Create hop list for an unknown destination.
 	hops := []route.Vertex{ctx.aliases["b"], ctx.aliases["y"]}
-	_, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, &payAddr)
+	_, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	noChanErr := ErrNoChannel{}
 	require.ErrorAs(t, err, &noChanErr)
 	require.Equal(t, 1, noChanErr.position)
@@ -1664,7 +1671,9 @@ func TestBuildRoute(t *testing.T) {
 	amt := lnwire.NewMSatFromSatoshis(100)
 
 	// Build the route for the given amount.
-	rt, err := ctx.router.BuildRoute(fn.Some(amt), hops, nil, 40, &payAddr)
+	rt, err := ctx.router.BuildRoute(
+		fn.Some(amt), hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	require.NoError(t, err)
 
 	// Check that we get the expected route back. The total amount should be
@@ -1674,7 +1683,9 @@ func TestBuildRoute(t *testing.T) {
 	require.Equal(t, lnwire.MilliSatoshi(106000), rt.TotalAmount)
 
 	// Build the route for the minimum amount.
-	rt, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, &payAddr)
+	rt, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	require.NoError(t, err)
 
 	// Check that we get the expected route back. The minimum that we can
@@ -1690,7 +1701,9 @@ func TestBuildRoute(t *testing.T) {
 	// Test a route that contains incompatible channel htlc constraints.
 	// There is no amount that can pass through both channel 5 and 4.
 	hops = []route.Vertex{ctx.aliases["e"], ctx.aliases["c"]}
-	_, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, nil)
+	_, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, nil, fn.None[[]byte](),
+	)
 	require.Error(t, err)
 	noChanErr = ErrNoChannel{}
 	require.ErrorAs(t, err, &noChanErr)
@@ -1708,7 +1721,9 @@ func TestBuildRoute(t *testing.T) {
 	// amount that could be delivered to the receiver of 21819 msat, using
 	// policy of channel 3.
 	hops = []route.Vertex{ctx.aliases["b"], ctx.aliases["z"]}
-	rt, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, &payAddr)
+	rt, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	require.NoError(t, err)
 	checkHops(rt, []uint64{1, 8}, payAddr)
 	require.Equal(t, lnwire.MilliSatoshi(21200), rt.TotalAmount)
@@ -1720,7 +1735,9 @@ func TestBuildRoute(t *testing.T) {
 	// We get 106000 - 1000 (base in) - 0.001 * 106000 (rate in) = 104894.
 	hops = []route.Vertex{ctx.aliases["d"], ctx.aliases["f"]}
 	amt = lnwire.NewMSatFromSatoshis(100)
-	rt, err = ctx.router.BuildRoute(fn.Some(amt), hops, nil, 40, &payAddr)
+	rt, err = ctx.router.BuildRoute(
+		fn.Some(amt), hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	require.NoError(t, err)
 	checkHops(rt, []uint64{9, 10}, payAddr)
 	require.EqualValues(t, 104894, rt.TotalAmount)
@@ -1734,7 +1751,9 @@ func TestBuildRoute(t *testing.T) {
 	// of 20179 msat, which results in underpayment of 1 msat in fee. There
 	// is a third pass through newRoute in which this gets corrected to end
 	hops = []route.Vertex{ctx.aliases["d"], ctx.aliases["f"]}
-	rt, err = ctx.router.BuildRoute(noAmt, hops, nil, 40, &payAddr)
+	rt, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, &payAddr, fn.None[[]byte](),
+	)
 	require.NoError(t, err)
 	checkHops(rt, []uint64{9, 10}, payAddr)
 	require.EqualValues(t, 20180, rt.TotalAmount, "%v", rt.TotalAmount)
@@ -2173,7 +2192,8 @@ func TestSendToRouteSkipTempErrSuccess(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
-		ClosedSCIDs: mockClosedSCIDs,
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Register mockers with the expected method calls.
@@ -2208,7 +2228,7 @@ func TestSendToRouteSkipTempErrSuccess(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, nil)
 
 	// Expect a successful send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.NoError(t, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2257,11 +2277,12 @@ func TestSendToRouteSkipTempErrNonMPP(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
-		ClosedSCIDs: mockClosedSCIDs,
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Expect an error to be returned.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.ErrorIs(t, ErrSkipTempErr, err)
 	require.Nil(t, attempt)
 
@@ -2312,7 +2333,8 @@ func TestSendToRouteSkipTempErrTempFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
-		ClosedSCIDs: mockClosedSCIDs,
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -2345,7 +2367,7 @@ func TestSendToRouteSkipTempErrTempFailure(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, nil)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.Equal(t, tempErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2395,7 +2417,8 @@ func TestSendToRouteSkipTempErrPermanentFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
-		ClosedSCIDs: mockClosedSCIDs,
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -2432,7 +2455,7 @@ func TestSendToRouteSkipTempErrPermanentFailure(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, &failureReason)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.Equal(t, permErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2482,7 +2505,8 @@ func TestSendToRouteTempFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
-		ClosedSCIDs: mockClosedSCIDs,
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -2517,7 +2541,7 @@ func TestSendToRouteTempFailure(t *testing.T) {
 	).Return(nil, nil)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRoute(payHash, rt)
+	attempt, err := router.SendToRoute(payHash, rt, nil)
 	require.Equal(t, tempErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2943,7 +2967,7 @@ func (m *mockGraphBuilder) setNextReject(reject bool) {
 	m.rejectUpdate = reject
 }
 
-func (m *mockGraphBuilder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate) bool {
+func (m *mockGraphBuilder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate1) bool {
 	if m.rejectUpdate {
 		return false
 	}

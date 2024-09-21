@@ -263,6 +263,8 @@ type server struct {
 
 	invoices *invoices.InvoiceRegistry
 
+	invoiceHtlcModifier *invoices.HtlcModificationInterceptor
+
 	channelNotifier *channelnotifier.ChannelNotifier
 
 	peerNotifier *peernotifier.PeerNotifier
@@ -561,6 +563,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		return nil, err
 	}
 
+	invoiceHtlcModifier := invoices.NewHtlcModificationInterceptor()
 	registryConfig := invoices.RegistryConfig{
 		FinalCltvRejectDelta:        lncfg.DefaultFinalCltvRejectDelta,
 		HtlcHoldDuration:            invoices.DefaultHtlcHoldDuration,
@@ -570,6 +573,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		GcCanceledInvoicesOnStartup: cfg.GcCanceledInvoicesOnStartup,
 		GcCanceledInvoicesOnTheFly:  cfg.GcCanceledInvoicesOnTheFly,
 		KeysendHoldTime:             cfg.KeysendHoldTime,
+		HtlcInterceptor:             invoiceHtlcModifier,
 	}
 
 	s := &server{
@@ -618,6 +622,8 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		peerConnectedListeners:    make(map[string][]chan<- lnpeer.Peer),
 		peerDisconnectedListeners: make(map[string][]chan<- struct{}),
 
+		invoiceHtlcModifier: invoiceHtlcModifier,
+
 		customMessageServer: subscribe.NewServer(),
 
 		tlsManager: tlsManager,
@@ -644,7 +650,18 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 	thresholdSats := btcutil.Amount(cfg.MaxFeeExposure)
 	thresholdMSats := lnwire.NewMSatFromSatoshis(thresholdSats)
 
-	s.aliasMgr, err = aliasmgr.NewManager(dbs.ChanStateDB)
+	linkUpdater := func(shortID lnwire.ShortChannelID) error {
+		link, err := s.htlcSwitch.GetLinkByShortID(shortID)
+		if err != nil {
+			return err
+		}
+
+		s.htlcSwitch.UpdateLinkAliases(link)
+
+		return nil
+	}
+
+	s.aliasMgr, err = aliasmgr.NewManager(dbs.ChanStateDB, linkUpdater)
 	if err != nil {
 		return nil, err
 	}
@@ -1011,6 +1028,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		Clock:              clock.NewDefaultClock(),
 		ApplyChannelUpdate: s.graphBuilder.ApplyChannelUpdate,
 		ClosedSCIDs:        s.fetchClosedChannelSCIDs(),
+		TrafficShaper:      implCfg.TrafficShaper,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("can't create router: %w", err)
@@ -1030,6 +1048,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 
 	s.authGossiper = discovery.New(discovery.Config{
 		Graph:                 s.graphBuilder,
+		ChainIO:               s.cc.ChainIO,
 		Notifier:              s.cc.ChainNotifier,
 		ChainHash:             *s.cfg.ActiveNetParams.GenesisHash,
 		Broadcast:             s.BroadcastMessage,
@@ -1274,6 +1293,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 			return &pc.Incoming
 		},
 		AuxLeafStore: implCfg.AuxLeafStore,
+		AuxSigner:    implCfg.AuxSigner,
 	}, dbs.ChanStateDB)
 
 	// Select the configuration and funding parameters for Bitcoin.
@@ -1518,9 +1538,11 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		EnableUpfrontShutdown:         cfg.EnableUpfrontShutdown,
 		MaxAnchorsCommitFeeRate: chainfee.SatPerKVByte(
 			s.cfg.MaxCommitFeeRateAnchors * 1000).FeePerKWeight(),
-		DeleteAliasEdge:   deleteAliasEdge,
-		AliasManager:      s.aliasMgr,
-		IsSweeperOutpoint: s.sweeper.IsSweeperOutpoint,
+		DeleteAliasEdge:      deleteAliasEdge,
+		AliasManager:         s.aliasMgr,
+		IsSweeperOutpoint:    s.sweeper.IsSweeperOutpoint,
+		AuxFundingController: implCfg.AuxFundingController,
+		AuxSigner:            implCfg.AuxSigner,
 	})
 	if err != nil {
 		return nil, err
@@ -1741,7 +1763,7 @@ func (s *server) UpdateRoutingConfig(cfg *routing.MissionControlConfig) {
 // signAliasUpdate takes a ChannelUpdate and returns the signature. This is
 // used for option_scid_alias channels where the ChannelUpdate to be sent back
 // may differ from what is on disk.
-func (s *server) signAliasUpdate(u *lnwire.ChannelUpdate) (*ecdsa.Signature,
+func (s *server) signAliasUpdate(u *lnwire.ChannelUpdate1) (*ecdsa.Signature,
 	error) {
 
 	data, err := u.DataToSign()
@@ -2100,6 +2122,12 @@ func (s *server) Start() error {
 
 		cleanup = cleanup.add(s.interceptableSwitch.Stop)
 		if err := s.interceptableSwitch.Start(); err != nil {
+			startErr = err
+			return
+		}
+
+		cleanup = cleanup.add(s.invoiceHtlcModifier.Stop)
+		if err := s.invoiceHtlcModifier.Start(); err != nil {
 			startErr = err
 			return
 		}
@@ -4076,7 +4104,9 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 		MaxFeeExposure:         thresholdMSats,
 		Quit:                   s.quit,
 		AuxLeafStore:           s.implCfg.AuxLeafStore,
+		AuxSigner:              s.implCfg.AuxSigner,
 		MsgRouter:              s.implCfg.MsgRouter,
+		AuxChanCloser:          s.implCfg.AuxChanCloser,
 	}
 
 	copy(pCfg.PubKeyBytes[:], peerAddr.IdentityKey.SerializeCompressed())
@@ -4814,10 +4844,10 @@ func (s *server) fetchNodeAdvertisedAddrs(pub *btcec.PublicKey) ([]net.Addr, err
 // fetchLastChanUpdate returns a function which is able to retrieve our latest
 // channel update for a target channel.
 func (s *server) fetchLastChanUpdate() func(lnwire.ShortChannelID) (
-	*lnwire.ChannelUpdate, error) {
+	*lnwire.ChannelUpdate1, error) {
 
 	ourPubKey := s.identityECDH.PubKey().SerializeCompressed()
-	return func(cid lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
+	return func(cid lnwire.ShortChannelID) (*lnwire.ChannelUpdate1, error) {
 		info, edge1, edge2, err := s.graphBuilder.GetChannelByID(cid)
 		if err != nil {
 			return nil, err
@@ -4832,7 +4862,7 @@ func (s *server) fetchLastChanUpdate() func(lnwire.ShortChannelID) (
 // applyChannelUpdate applies the channel update to the different sub-systems of
 // the server. The useAlias boolean denotes whether or not to send an alias in
 // place of the real SCID.
-func (s *server) applyChannelUpdate(update *lnwire.ChannelUpdate,
+func (s *server) applyChannelUpdate(update *lnwire.ChannelUpdate1,
 	op *wire.OutPoint, useAlias bool) error {
 
 	var (

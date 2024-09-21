@@ -1033,16 +1033,12 @@ func CreateCommitTx(chanType channeldb.ChannelType,
 // CoopCloseBalance returns the final balances that should be used to create
 // the cooperative close tx, given the channel type and transaction fee.
 func CoopCloseBalance(chanType channeldb.ChannelType, isInitiator bool,
-	coopCloseFee btcutil.Amount, localCommit channeldb.ChannelCommitment) (
-	btcutil.Amount, btcutil.Amount, error) {
-
-	// Get both parties' balances from the latest commitment.
-	ourBalance := localCommit.LocalBalance.ToSatoshis()
-	theirBalance := localCommit.RemoteBalance.ToSatoshis()
+	coopCloseFee, ourBalance, theirBalance,
+	commitFee btcutil.Amount) (btcutil.Amount, btcutil.Amount, error) {
 
 	// We'll make sure we account for the complete balance by adding the
 	// current dangling commitment fee to the balance of the initiator.
-	initiatorDelta := localCommit.CommitFee
+	initiatorDelta := commitFee
 
 	// Since the initiator's balance also is stored after subtracting the
 	// anchor values, add that back in case this was an anchor commitment.
@@ -1229,10 +1225,10 @@ func genHtlcScript(chanType channeldb.ChannelType, isIncoming bool,
 // is incoming and if it's being applied to our commitment transaction or that
 // of the remote node's. Additionally, in order to be able to efficiently
 // locate the added HTLC on the commitment transaction from the
-// PaymentDescriptor that generated it, the generated script is stored within
+// paymentDescriptor that generated it, the generated script is stored within
 // the descriptor itself.
 func addHTLC(commitTx *wire.MsgTx, whoseCommit lntypes.ChannelParty,
-	isIncoming bool, paymentDesc *PaymentDescriptor,
+	isIncoming bool, paymentDesc *paymentDescriptor,
 	keyRing *CommitmentKeyRing, chanType channeldb.ChannelType,
 	auxLeaf input.AuxTapLeaf) error {
 
@@ -1253,7 +1249,7 @@ func addHTLC(commitTx *wire.MsgTx, whoseCommit lntypes.ChannelParty,
 	amountPending := int64(paymentDesc.Amount.ToSatoshis())
 	commitTx.AddTxOut(wire.NewTxOut(amountPending, pkScript))
 
-	// Store the pkScript of this particular PaymentDescriptor so we can
+	// Store the pkScript of this particular paymentDescriptor so we can
 	// quickly locate it within the commitment transaction later.
 	if whoseCommit.IsLocal() {
 		paymentDesc.ourPkScript = pkScript
