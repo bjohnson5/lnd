@@ -210,10 +210,10 @@ func NewChannelGraph(db kvdb.Backend, rejectCacheSize, chanCacheSize int,
 
 	g := &ChannelGraph{
 		db:          db,
-		//rejectCache: newRejectCache(rejectCacheSize),
-		//chanCache:   newChannelCache(chanCacheSize),
-		rejectCache: newRejectCache(0),
-		chanCache: newChannelCache(0),
+		rejectCache: newRejectCache(rejectCacheSize),
+		chanCache:   newChannelCache(chanCacheSize),
+		//rejectCache: newRejectCache(0),
+		//chanCache:   newChannelCache(0),
 	}
 	g.chanScheduler = batch.NewTimeScheduler(
 		db, &g.cacheMu, batchCommitInterval,
@@ -224,7 +224,12 @@ func NewChannelGraph(db kvdb.Backend, rejectCacheSize, chanCacheSize int,
 
 	// The graph cache can be turned off (e.g. for mobile users) for a
 	// speed/memory usage tradeoff.
-	useGraphCache = false
+
+	// Turning the graph cache off will cause the route finding process to
+	// use the channel db and will cause the bbolt db to be remapped to memory
+	// often. This can lead to a race condition deadlock between the route finding
+	// and the channel state machine.
+	useGraphCache = true
 	if useGraphCache {
 		g.graphCache = NewGraphCache(preAllocCacheNumNodes)
 		startTime := time.Now()
